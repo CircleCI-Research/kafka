@@ -1,0 +1,146 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ---------------------------------------------------------------------------
+# Setup pipeline.
+#
+# This is the CircleCI translation of the "configure" job of
+# .github/workflows/build.yml. GitHub Actions lets a job publish `outputs` that
+# downstream jobs read with `needs.<job>.outputs.<name>`. CircleCI has no such
+# mechanism, so the equivalent is a *setup pipeline*: one job computes values
+# and hands them to a continuation config as pipeline parameters.
+#
+# Everything that actually verifies code lives in .circleci/continue_config.yml
+#
+# The `run-*` parameters below emulate GitHub's `workflow_dispatch` triggers.
+# Trigger them with the v2 pipeline API, e.g.
+#   POST /api/v2/project/<slug>/pipeline
+#   {"branch": "trunk", "parameters": {"run-ci": false, "run-docker-scan": true}}
+# ---------------------------------------------------------------------------
+
+version: 2.1
+setup: true
+
+orbs:
+  # Requires `curl` and `jq` in the executor -- cimg/base ships both.
+  continuation: circleci/continuation@1.1.0
+
+parameters:
+  # --- Default (push / PR) entry point, equivalent to .github/workflows/ci.yml
+  run-ci:
+    type: boolean
+    default: true
+
+  # --- workflow_dispatch: .github/workflows/deflake.yml
+  run-deflake:
+    type: boolean
+    default: false
+  deflake-test-module:
+    type: string
+    default: ":core"
+  deflake-test-pattern:
+    type: string
+    default: "*"
+  deflake-test-repeat:
+    type: integer
+    default: 1
+  deflake-java-version:
+    type: string
+    default: "17"
+
+  # --- workflow_dispatch: .github/workflows/docker_build_and_test.yml
+  run-docker-build-test:
+    type: boolean
+    default: false
+  docker-image-type:
+    type: enum
+    enum: ["jvm", "native"]
+    default: "jvm"
+  docker-kafka-url:
+    type: string
+    default: ""
+
+  # --- workflow_dispatch: .github/workflows/docker_official_image_build_and_test.yml
+  run-docker-official-image-build-test:
+    type: boolean
+    default: false
+  docker-kafka-version:
+    type: string
+    default: ""
+
+  # --- workflow_dispatch: .github/workflows/prepare_docker_official_image_source.yml
+  run-prepare-docker-official-image-source:
+    type: boolean
+    default: false
+
+  # --- schedule + workflow_dispatch: .github/workflows/docker_scan.yml
+  run-docker-scan:
+    type: boolean
+    default: false
+
+  # --- schedule + workflow_dispatch: .github/workflows/generate-reports.yml
+  run-flaky-test-report:
+    type: boolean
+    default: false
+
+jobs:
+  configure:
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    environment:
+      # Pass-through of the dispatch parameters. These are injected as YAML
+      # scalars by the config processor (never spliced into a shell command),
+      # so values containing shell metacharacters cannot be evaluated here.
+      P_RUN_CI: << pipeline.parameters.run-ci >>
+      P_RUN_DEFLAKE: << pipeline.parameters.run-deflake >>
+      P_DEFLAKE_TEST_MODULE: << pipeline.parameters.deflake-test-module >>
+      P_DEFLAKE_TEST_PATTERN: << pipeline.parameters.deflake-test-pattern >>
+      P_DEFLAKE_TEST_REPEAT: << pipeline.parameters.deflake-test-repeat >>
+      P_DEFLAKE_JAVA_VERSION: << pipeline.parameters.deflake-java-version >>
+      P_RUN_DOCKER_BUILD_TEST: << pipeline.parameters.run-docker-build-test >>
+      P_DOCKER_IMAGE_TYPE: << pipeline.parameters.docker-image-type >>
+      P_DOCKER_KAFKA_URL: << pipeline.parameters.docker-kafka-url >>
+      P_RUN_DOCKER_OFFICIAL_IMAGE_BUILD_TEST: << pipeline.parameters.run-docker-official-image-build-test >>
+      P_DOCKER_KAFKA_VERSION: << pipeline.parameters.docker-kafka-version >>
+      P_RUN_PREPARE_DOCKER_OFFICIAL_IMAGE_SOURCE: << pipeline.parameters.run-prepare-docker-official-image-source >>
+      P_RUN_DOCKER_SCAN: << pipeline.parameters.run-docker-scan >>
+      P_RUN_FLAKY_TEST_REPORT: << pipeline.parameters.run-flaky-test-report >>
+      # Equivalent of build.yml's "Configure Outputs" step.
+      TRUNK_BRANCH: trunk
+      PARAMS_FILE: /tmp/pipeline-parameters.json
+    steps:
+      - checkout
+      - run:
+          # Equivalent of build.yml's `- name: Env / run: printenv`
+          name: Env
+          command: printenv | sort
+      - run:
+          name: Compute continuation parameters
+          command: .circleci/scripts/compute-params.sh
+      - run:
+          name: Show computed parameters
+          command: cat "$PARAMS_FILE"
+      - store_artifacts:
+          path: /tmp/pipeline-parameters.json
+          destination: pipeline-parameters.json
+      - continuation/continue:
+          configuration_path: .circleci/continue_config.yml
+          parameters: /tmp/pipeline-parameters.json
+
+workflows:
+  setup:
+    jobs:
+      - configure

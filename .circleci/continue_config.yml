@@ -1,0 +1,1218 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ---------------------------------------------------------------------------
+# Continuation pipeline: everything that verifies code.
+#
+# Source workflows translated here:
+#   .github/workflows/ci.yml     + build.yml  -> workflows "ci" / "ci-draft"
+#   .github/workflows/deflake.yml             -> workflow "deflake"
+#   .github/workflows/docker_build_and_test.yml
+#   .github/workflows/docker_official_image_build_and_test.yml
+#   .github/workflows/prepare_docker_official_image_source.yml
+#   .github/workflows/docker_scan.yml
+#   .github/workflows/generate-reports.yml
+#   .github/workflows/pr-linter.yml
+#
+# Composite actions inlined as commands:
+#   .github/actions/setup-python/action.yml  -> command "setup-python"
+#   .github/actions/setup-gradle/action.yml  -> commands "restore-gradle-cache"
+#                                               / "save-gradle-cache"
+#   .github/actions/run-gradle/action.yml    -> inlined into job "test"
+#
+# Every parameter below is supplied by .circleci/scripts/compute-params.sh via
+# the continuation orb. The two name sets must match exactly.
+#
+# Project environment variables / context values this config depends on. None
+# are set here; all must be configured on the CircleCI project (or a context
+# attached to it). Every one is optional in the sense that the config degrades
+# instead of failing when it is absent.
+#
+#   DEVELOCITY_ACCESS_KEY    Publishes Gradle Build Scans to develocity.apache.org.
+#                            Read by the Gradle build itself. When it is unset,
+#                            compute-params.sh resolves gradle-scan-arg to
+#                            --no-scan so `validate` and `test` do not try to
+#                            publish. GHA: secrets.DEVELOCITY_ACCESS_KEY.
+#   DEVELOCITY_ACCESS_TOKEN  Used by .github/scripts/develocity_reports.py in the
+#                            flaky-test-report job. GHA:
+#                            secrets.KAFKA_DEVELOCITY_ACCESS_KEY.
+#   GITHUB_TOKEN             Used to detect draft pull requests in the setup
+#                            pipeline and by the pr-lint job's `gh` calls. GHA
+#                            got both for free from secrets.GITHUB_TOKEN.
+#
+# Everything else the steps read (CIRCLE_*, BASH_ENV) is provided by CircleCI.
+# ---------------------------------------------------------------------------
+
+version: 2.1
+
+parameters:
+  # --- Computed by the setup pipeline (replaces build.yml job outputs)
+  is-trunk:
+    type: boolean
+    default: false
+  is-pull-request:
+    type: boolean
+    default: false
+  is-public-fork:
+    type: boolean
+    default: false
+  is-draft:
+    type: boolean
+    default: false
+  test-catalog-days:
+    type: integer
+    default: 7
+  target-sha:
+    type: string
+    default: ""
+  gradle-scan-arg:
+    type: string
+    default: "--no-scan"
+  test-catalog-commit-message:
+    type: string
+    default: "Update test catalog data"
+
+  # --- Passed through from the setup pipeline (workflow_dispatch equivalents)
+  run-ci:
+    type: boolean
+    default: true
+  run-deflake:
+    type: boolean
+    default: false
+  deflake-test-module:
+    type: string
+    default: ":core"
+  deflake-test-pattern:
+    type: string
+    default: "*"
+  deflake-test-repeat:
+    type: integer
+    default: 1
+  deflake-java-version:
+    type: string
+    default: "17"
+  run-docker-build-test:
+    type: boolean
+    default: false
+  docker-image-type:
+    type: enum
+    enum: ["jvm", "native"]
+    default: "jvm"
+  docker-kafka-url:
+    type: string
+    default: ""
+  run-docker-official-image-build-test:
+    type: boolean
+    default: false
+  docker-kafka-version:
+    type: string
+    default: ""
+  run-prepare-docker-official-image-source:
+    type: boolean
+    default: false
+  run-docker-scan:
+    type: boolean
+    default: false
+  run-flaky-test-report:
+    type: boolean
+    default: false
+
+# ---------------------------------------------------------------------------
+# Executors
+# ---------------------------------------------------------------------------
+executors:
+  jdk:
+    parameters:
+      java:
+        type: string
+        default: "17"
+      size:
+        type: string
+        default: "large"
+    docker:
+      # actions/setup-java installs Temurin; cimg/openjdk is the closest
+      # CircleCI convenience image. See "setup_required_before_first_run".
+      - image: cimg/openjdk:<< parameters.java >>.0
+    resource_class: << parameters.size >>
+    working_directory: ~/project
+
+  python:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: medium
+    working_directory: ~/project
+
+  linux-machine:
+    machine:
+      image: ubuntu-2404:current
+      docker_layer_caching: false
+    resource_class: large
+    working_directory: ~/project
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+commands:
+  setup-python:
+    # Port of .github/actions/setup-python/action.yml
+    # NOTE: GHA pinned CPython 3.12 via actions/setup-python. On the cimg/openjdk
+    # executors we use the distro interpreter, so scripts are invoked as
+    # `python3` rather than `python`.
+    # A virtualenv rather than `pip install --user`: Debian/Ubuntu 24.04 marks the
+    # system interpreter as externally managed (PEP 668) and refuses the latter.
+    # Putting the venv on PATH via $BASH_ENV also gives later steps a plain
+    # `python`, which is what the .github/scripts helpers expect.
+    description: "Install Python dependencies for the .github/scripts helpers"
+    parameters:
+      requirements:
+        type: string
+        default: .github/scripts/requirements.txt
+    steps:
+      - run:
+          name: Setup Python
+          environment:
+            REQUIREMENTS: << parameters.requirements >>
+          command: |
+            if ! command -v python3 >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends python3 python3-venv
+            fi
+            if ! python3 -m venv --help >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends python3-venv
+            fi
+            python3 -m venv "$HOME/ci-venv"
+            echo 'export PATH="$HOME/ci-venv/bin:$PATH"' >> "$BASH_ENV"
+            "$HOME/ci-venv/bin/python" -m pip install --upgrade pip
+            "$HOME/ci-venv/bin/python" -m pip install -r "$REQUIREMENTS"
+            "$HOME/ci-venv/bin/python" --version
+
+  restore-gradle-cache:
+    # Port of gradle/actions/setup-gradle `cache-read-only`.
+    # GHA used cache-read-only on PR builds and cache-write-only on trunk, so
+    # trunk deliberately never restores.
+    #
+    # `scope` keeps each job family in its own cache namespace. CircleCI caches
+    # are immutable, so without it the seven trunk jobs would all race to write
+    # one key and six of them would be silently discarded -- and a JDK 17 job
+    # could then restore a Gradle home populated by a JDK 25 job.
+    description: "Restore the Gradle user home cache (skipped on trunk)"
+    parameters:
+      scope:
+        type: string
+    steps:
+      - unless:
+          condition: << pipeline.parameters.is-trunk >>
+          steps:
+            - restore_cache:
+                keys:
+                  - gradle-home-v1-{{ arch }}-<< parameters.scope >>-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}-{{ checksum "gradle.properties" }}-
+                  - gradle-home-v1-{{ arch }}-<< parameters.scope >>-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}-
+                  - gradle-home-v1-{{ arch }}-<< parameters.scope >>-
+
+  save-gradle-cache:
+    # Port of gradle/actions/setup-gradle `cache-write-only` (trunk only).
+    # {{ .Revision }} makes every trunk commit produce a fresh entry, which is
+    # what the "gradle-home-v1|...-<sha>" keys in .github/workflows/README.md do.
+    description: "Save the Gradle user home cache (trunk only)"
+    parameters:
+      scope:
+        type: string
+    steps:
+      - when:
+          condition: << pipeline.parameters.is-trunk >>
+          steps:
+            - save_cache:
+                key: gradle-home-v1-{{ arch }}-<< parameters.scope >>-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}-{{ checksum "gradle.properties" }}-{{ .Revision }}
+                paths:
+                  # Mirrors gradle-home-cache-includes: caches, notifications, jdks
+                  - ~/.gradle/caches
+                  - ~/.gradle/notifications
+                  - ~/.gradle/jdks
+                  - ~/.gradle/wrapper
+
+  store-html-reports:
+    description: "Stage glob-matched HTML reports and publish them as artifacts"
+    parameters:
+      pattern:
+        type: string
+      destination:
+        type: string
+      stage-dir:
+        type: string
+        default: "/tmp/artifacts"
+    steps:
+      - run:
+          name: Stage << parameters.destination >>
+          when: always
+          environment:
+            STAGE_DIR: << parameters.stage-dir >>
+            PATTERN: << parameters.pattern >>
+          command: |
+            .circleci/scripts/collect-artifacts.sh "$STAGE_DIR" "$PATTERN"
+      - store_artifacts:
+          when: always
+          path: << parameters.stage-dir >>
+          destination: << parameters.destination >>
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+jobs:
+  # =========================================================================
+  # build.yml :: load-catalog
+  # =========================================================================
+  load-catalog:
+    executor:
+      name: jdk
+      java: "17"
+      size: medium
+    environment:
+      DAYS: << pipeline.parameters.test-catalog-days >>
+    steps:
+      - checkout
+      - run:
+          name: Checkout test-catalog branch
+          command: |
+            git fetch --depth=100 origin test-catalog:refs/remotes/origin/test-catalog
+            git worktree add --detach test-catalog origin/test-catalog
+      - run:
+          name: Checkout catalog at earlier date
+          command: |
+            if [ "$DAYS" = "0" ]; then
+              echo "Pull request build: using the tip of test-catalog"
+              exit 0
+            fi
+            cd test-catalog
+            SHA=$(git rev-list -1 --before "$DAYS.days.ago" origin/test-catalog)
+            echo "$SHA"
+            git switch --detach "$SHA"
+            git show --no-patch
+      - setup-python
+      # Prior to this step we don't expect any errors. From here on the job must
+      # not fail, matching `continue-on-error: true` in build.yml.
+      - run:
+          name: Combine Catalog into single file
+          command: |
+            if python3 .github/scripts/format-test-catalog.py --path "test-catalog/test-catalog/**/*.yaml"; then
+              echo "Combined test catalog written"
+            else
+              echo "WARNING: failed to combine the test catalog; downstream jobs will treat every test as new" >&2
+              : > combined-test-catalog.txt
+            fi
+            test -f combined-test-catalog.txt || : > combined-test-catalog.txt
+            wc -l combined-test-catalog.txt
+      - store_artifacts:
+          when: always
+          path: combined-test-catalog.txt
+          destination: combined-test-catalog.txt
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - combined-test-catalog.txt
+
+  # =========================================================================
+  # build.yml :: validate  ("Compile and Check (Merge Ref)")
+  # =========================================================================
+  validate:
+    executor:
+      name: jdk
+      java: "25"
+      size: xlarge
+    environment:
+      SCAN_ARG: << pipeline.parameters.gradle-scan-arg >>
+      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      # .github/scripts/checkstyle.py and rat.py both read GITHUB_WORKSPACE to
+      # turn absolute report paths into repo-relative ones.
+      GITHUB_WORKSPACE: /home/circleci/project
+    steps:
+      - run:
+          name: Env
+          command: printenv | sort
+      - checkout
+      - setup-python
+      - run:
+          name: Check Python dependency conflicts
+          command: python3 -m pip install --dry-run ./tests
+      - restore-gradle-cache:
+          scope: validate
+      - run:
+          name: Compile and validate
+          no_output_timeout: 60m
+          # Gradle flags
+          # --build-cache:  Let Gradle restore the build cache
+          # --info:         Verbose logging, as on GitHub Actions
+          # --scan/--no-scan: computed by the setup pipeline; public forks have
+          #                 no DEVELOCITY_ACCESS_KEY and must not try to publish
+          command: |
+            set +e
+            ./gradlew --build-cache --info "$SCAN_ARG" check releaseTarGz -x test
+            echo "$?" > /tmp/gradle-check-exitcode
+            cat /tmp/gradle-check-exitcode
+      - save-gradle-cache:
+          scope: validate
+      # actions/upload-artifact used the glob `**/build/**/*.html`. `find -path`
+      # wildcards cross "/", so a single pattern covers every depth.
+      - store-html-reports:
+          pattern: "*/build/*.html"
+          destination: check-reports
+          stage-dir: /tmp/check-reports
+      - run:
+          name: Annotate checkstyle and Rat errors
+          when: always
+          command: |
+            code=$(cat /tmp/gradle-check-exitcode 2>/dev/null || echo 1)
+            if [ "$code" = "0" ]; then
+              echo "Gradle check succeeded; nothing to annotate"
+              exit 0
+            fi
+            python3 .github/scripts/checkstyle.py || true
+            python3 .github/scripts/rat.py || true
+      # Ordering invariant: this gate must come after every artifact/annotation
+      # step (so they still run on failure) but before the documentation and
+      # licence checks, which GitHub Actions skipped when `check` failed.
+      - run:
+          name: Fail if Gradle check failed
+          command: |
+            code=$(cat /tmp/gradle-check-exitcode 2>/dev/null || echo 1)
+            if [ "$code" != "0" ]; then
+              echo "Gradle 'check releaseTarGz' failed with exit code $code"
+              exit "$code"
+            fi
+      - run:
+          name: Check generated documentation
+          # Check if there are any empty files under ./site-docs/generated. If any
+          # empty files are found, print an error message and list them.
+          command: |
+            VERSION=$(./gradlew properties | grep version: | awk '{print $NF}' | head -n 1)
+            tar zxvf "core/build/distributions/kafka_2.13-${VERSION}-site-docs.tgz"
+            if find ./site-docs/generated -type f -exec grep -L "." {} \; | grep -q "."; then
+              echo "One or more documentation files are empty!" >&2
+              find ./site-docs/generated -type f -exec grep -L "." {} \; >&2
+              exit 1
+            fi
+      - run:
+          name: Verify license file
+          command: python3 committer-tools/verify_license.py --skip-build
+
+  # =========================================================================
+  # build.yml :: test  (matrix java x run-flaky x run-new)
+  # Inlines .github/actions/run-gradle/action.yml
+  # =========================================================================
+  test:
+    parameters:
+      java:
+        type: string
+      run-flaky:
+        type: boolean
+      run-new:
+        type: boolean
+    executor:
+      name: jdk
+      java: << parameters.java >>
+      size: xlarge
+    environment:
+      SCAN_ARG: << pipeline.parameters.gradle-scan-arg >>
+      TIMEOUT_MINUTES: "210"
+      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      GITHUB_WORKSPACE: /home/circleci/project
+    steps:
+      - checkout
+      # build.yml derived these from the matrix at expression-evaluation time:
+      #   job-variation: <java>-<flaky|noflaky>-<new|nonew>
+      #   test-retries:  matrix.run-flaky && 3 || 1
+      #   test-repeat:   (!is-trunk && matrix.run-new) && 3 || 1
+      # They are resolved here at config-compile time rather than in the shell.
+      # Deriving them from `$P_RUN_FLAKY` would depend on how the agent
+      # stringifies a YAML boolean in `environment:`, which is unspecified.
+      - when:
+          condition: << parameters.run-flaky >>
+          steps:
+            - run:
+                name: Variation labels (flaky)
+                command: |
+                  echo 'export FLAKY_LABEL=flaky' >> "$BASH_ENV"
+                  echo 'export TEST_RETRIES=3' >> "$BASH_ENV"
+      - unless:
+          condition: << parameters.run-flaky >>
+          steps:
+            - run:
+                name: Variation labels (noflaky)
+                command: |
+                  echo 'export FLAKY_LABEL=noflaky' >> "$BASH_ENV"
+                  echo 'export TEST_RETRIES=1' >> "$BASH_ENV"
+      - when:
+          condition: << parameters.run-new >>
+          steps:
+            - run:
+                name: Variation labels (new)
+                command: echo 'export NEW_LABEL=new' >> "$BASH_ENV"
+      - unless:
+          condition: << parameters.run-new >>
+          steps:
+            - run:
+                name: Variation labels (nonew)
+                command: echo 'export NEW_LABEL=nonew' >> "$BASH_ENV"
+      - when:
+          condition:
+            and:
+              - << parameters.run-new >>
+              - not: << pipeline.parameters.is-trunk >>
+          steps:
+            - run:
+                name: Repeat cluster tests three times
+                command: echo 'export TEST_REPEAT=3' >> "$BASH_ENV"
+      - unless:
+          condition:
+            and:
+              - << parameters.run-new >>
+              - not: << pipeline.parameters.is-trunk >>
+          steps:
+            - run:
+                name: Run cluster tests once
+                command: echo 'export TEST_REPEAT=1' >> "$BASH_ENV"
+      - run:
+          name: Compute job variation
+          command: |
+            echo "export JOB_VARIATION=<< parameters.java >>-${FLAKY_LABEL}-${NEW_LABEL}" >> "$BASH_ENV"
+            cat "$BASH_ENV"
+      - setup-python
+      - restore-gradle-cache:
+          scope: test-<< parameters.java >>-<< parameters.run-flaky >>-<< parameters.run-new >>
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Load Test Catalog
+          command: |
+            if [ -f /tmp/workspace/combined-test-catalog.txt ]; then
+              cp /tmp/workspace/combined-test-catalog.txt ./combined-test-catalog.txt
+              wc -l ./combined-test-catalog.txt
+            else
+              echo "WARNING: no test catalog available; continuing without one" >&2
+              : > ./combined-test-catalog.txt
+            fi
+      # Ordering invariant: thread-dump.sh must be backgrounded *before* the
+      # gradle invocation. It sleeps (TIMEOUT_MINUTES - 5) and then jstacks the
+      # Gradle workers, so starting it afterwards would never fire.
+      - run:
+          name: JUnit Tests
+          no_output_timeout: 220m
+          command: |
+            set +e
+            ./.github/scripts/thread-dump.sh &
+            timeout ${TIMEOUT_MINUTES}m ./gradlew --build-cache --continue "$SCAN_ARG" \
+              -PtestLoggingEvents=started,passed,skipped,failed \
+              -PmaxParallelForks=4 \
+              -PmaxTestRetries="$TEST_RETRIES" -PmaxTestRetryFailures=10 \
+              -Pkafka.test.catalog.file=./combined-test-catalog.txt \
+              -Pkafka.test.run.new=<< parameters.run-new >> \
+              -Pkafka.test.run.flaky=<< parameters.run-flaky >> \
+              -Pkafka.test.xml.output.dir="$JOB_VARIATION" \
+              -Pkafka.cluster.test.repeat="$TEST_REPEAT" \
+              -Pkafka.test.verbose=false \
+              -PcommitId=xxxxxxxxxxxxxxxx \
+              -x spotbugsMain \
+              -x spotbugsTest \
+              test
+            echo "$?" > /tmp/gradle-test-exitcode
+            cat /tmp/gradle-test-exitcode
+      - save-gradle-cache:
+          scope: test-<< parameters.java >>-<< parameters.run-flaky >>-<< parameters.run-new >>
+      - store_test_results:
+          when: always
+          path: build/junit-xml
+      - store-html-reports:
+          pattern: "*/build/reports/tests/*"
+          destination: junit-reports
+          stage-dir: /tmp/junit-html
+      - run:
+          name: Archive JUnit XML
+          when: always
+          command: |
+            mkdir -p /tmp/junit-xml
+            if [ -d build/junit-xml ]; then cp -R build/junit-xml/. /tmp/junit-xml/; fi
+      - store_artifacts:
+          when: always
+          path: /tmp/junit-xml
+          destination: junit-xml
+      - run:
+          name: Archive Thread Dumps
+          when: always
+          command: |
+            # Always create the directory: store_artifacts is given a literal
+            # path and must not be pointed at something that does not exist.
+            mkdir -p /tmp/thread-dumps
+            code=$(cat /tmp/gradle-test-exitcode 2>/dev/null || echo 0)
+            if [ "$code" = "124" ] && [ -d thread-dumps ]; then
+              mkdir -p "/tmp/thread-dumps/${JOB_VARIATION}"
+              cp -R thread-dumps/. "/tmp/thread-dumps/${JOB_VARIATION}/"
+            else
+              echo "No thread dumps to archive (exit code $code)"
+            fi
+      - store_artifacts:
+          when: always
+          path: /tmp/thread-dumps
+          destination: junit-thread-dumps
+      - run:
+          name: Archive build scan
+          when: always
+          command: |
+            mkdir -p "/tmp/build-scan/${JOB_VARIATION}"
+            if [ -d ~/.gradle/build-scan-data ]; then
+              cp -R ~/.gradle/build-scan-data/. "/tmp/build-scan/${JOB_VARIATION}/"
+            fi
+      - store_artifacts:
+          when: always
+          path: /tmp/build-scan
+          destination: build-scan
+      # Ordering invariant: junit.py renders links to the artifacts above, so it
+      # must run after they have been stored.
+      - run:
+          name: Parse JUnit tests
+          when: always
+          command: |
+            GRADLE_TEST_EXIT_CODE=$(cat /tmp/gradle-test-exitcode 2>/dev/null || echo 0)
+            export GRADLE_TEST_EXIT_CODE
+            JUNIT_REPORT_URL="${CIRCLE_BUILD_URL}/artifacts"
+            export JUNIT_REPORT_URL
+            THREAD_DUMP_URL="${CIRCLE_BUILD_URL}/artifacts"
+            export THREAD_DUMP_URL
+            python3 .github/scripts/junit.py --path build/junit-xml || true
+      - run:
+          name: Persist JUnit XML for the test catalog
+          when: always
+          command: |
+            mkdir -p /tmp/catalog-input/junit-xml /tmp/catalog-input/thread-dumps
+            if [ -d "build/junit-xml/${JOB_VARIATION}" ]; then
+              cp -R "build/junit-xml/${JOB_VARIATION}" "/tmp/catalog-input/junit-xml/${JOB_VARIATION}"
+            fi
+            if [ -d "/tmp/thread-dumps/${JOB_VARIATION}" ]; then
+              cp -R "/tmp/thread-dumps/${JOB_VARIATION}" "/tmp/catalog-input/thread-dumps/${JOB_VARIATION}"
+            fi
+      - persist_to_workspace:
+          root: /tmp/catalog-input
+          paths:
+            - junit-xml
+            - thread-dumps
+      # Ordering invariant: last step in the job. Everything above runs first so
+      # that reports exist even when the tests fail.
+      - run:
+          name: Fail if Gradle test failed
+          command: |
+            code=$(cat /tmp/gradle-test-exitcode 2>/dev/null || echo 1)
+            if [ "$code" != "0" ]; then
+              echo "Gradle test task failed with exit code $code"
+              exit "$code"
+            fi
+
+  # =========================================================================
+  # build.yml :: collate-test-catalog
+  # =========================================================================
+  collate-test-catalog:
+    executor:
+      name: jdk
+      java: "17"
+      size: medium
+    environment:
+      GITHUB_WORKSPACE: /home/circleci/project
+      GRADLE_TEST_EXIT_CODE: "0"
+    steps:
+      - checkout
+      - setup-python
+      - attach_workspace:
+          at: /tmp/workspace
+      # Only the JDK 25 runs feed the test catalog, exactly as the GHA artifact
+      # patterns `junit-thread-dumps-25-*` / `junit-xml-25-*` did.
+      - run:
+          name: Check For Thread Dump
+          command: |
+            found=0
+            for d in /tmp/workspace/thread-dumps/25-*; do
+              if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
+                echo "Found thread dumps in $d"
+                found=1
+              fi
+            done
+            if [ "$found" = "1" ]; then
+              echo "Found 'thread-dumps' directory. Will not proceed with test catalog collation."
+              exit 1
+            fi
+      - run:
+          name: Gather JDK 25 JUnit XMLs
+          command: |
+            mkdir -p junit-xml
+            matched=0
+            for d in /tmp/workspace/junit-xml/25-*; do
+              if [ -d "$d" ]; then
+                echo "Including $d"
+                cp -R "$d"/. junit-xml/
+                matched=$((matched + 1))
+              fi
+            done
+            if [ "$matched" = "0" ]; then
+              echo "No JDK 25 JUnit XML found in the workspace" >&2
+              exit 1
+            fi
+            find junit-xml -name '*.xml' | head -n 20
+      - run:
+          name: Collate Test Catalog
+          command: |
+            python3 .github/scripts/junit.py \
+              --path junit-xml \
+              --export-test-catalog ./test-catalog || true
+      - run:
+          name: Verify catalog was produced
+          # actions/upload-artifact used `if-no-files-found: error` here.
+          command: |
+            if [ -z "$(ls -A ./test-catalog 2>/dev/null)" ]; then
+              echo "Test catalog export produced no files" >&2
+              exit 1
+            fi
+      - store_artifacts:
+          when: always
+          path: test-catalog
+          destination: test-catalog
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - test-catalog
+
+  # =========================================================================
+  # build.yml :: update-test-catalog  (trunk only)
+  # =========================================================================
+  update-test-catalog:
+    executor:
+      name: jdk
+      java: "17"
+      size: small
+    environment:
+      COMMIT_MSG: << pipeline.parameters.test-catalog-commit-message >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Push Test Catalog
+          command: |
+            git fetch --depth=1 origin test-catalog:refs/remotes/origin/test-catalog
+            git worktree add --detach catalog-worktree origin/test-catalog
+            cd catalog-worktree
+            git switch -C test-catalog
+            rm -rf test-catalog
+            cp -R /tmp/workspace/test-catalog ./test-catalog
+            git config user.name 'circleci[bot]'
+            git config user.email 'circleci-bot@users.noreply.github.com'
+            git add test-catalog
+            git diff --quiet && git diff --staged --quiet || git commit -m "$COMMIT_MSG"
+            git push origin test-catalog
+
+  # =========================================================================
+  # build.yml :: checks-complete
+  # =========================================================================
+  checks-complete:
+    parameters:
+      fail-if-draft:
+        type: boolean
+        default: false
+    executor:
+      name: jdk
+      java: "17"
+      size: small
+    environment:
+      # Recorded so that the decisions taken by the setup pipeline are visible
+      # on the build that gates the merge.
+      PIPELINE_TARGET_SHA: << pipeline.parameters.target-sha >>
+      PIPELINE_IS_PUBLIC_FORK: << pipeline.parameters.is-public-fork >>
+      PIPELINE_IS_PULL_REQUEST: << pipeline.parameters.is-pull-request >>
+      PIPELINE_IS_TRUNK: << pipeline.parameters.is-trunk >>
+      PIPELINE_GRADLE_SCAN_ARG: << pipeline.parameters.gradle-scan-arg >>
+    steps:
+      - run:
+          name: Env
+          command: printenv | sort
+      - run:
+          name: Pipeline configuration
+          command: |
+            echo "target sha:     $PIPELINE_TARGET_SHA"
+            echo "pull request:   $PIPELINE_IS_PULL_REQUEST"
+            echo "public fork:    $PIPELINE_IS_PUBLIC_FORK"
+            echo "trunk:          $PIPELINE_IS_TRUNK"
+            echo "gradle scan:    $PIPELINE_GRADLE_SCAN_ARG"
+      - when:
+          condition: << parameters.fail-if-draft >>
+          steps:
+            - run:
+                name: Fail if Draft
+                command: |
+                  echo "Cannot merge a draft PR"
+                  exit 1
+      - run:
+          name: Check Dependency Outcomes
+          # In CircleCI a job with `requires:` only starts when every required
+          # job has succeeded, so reaching this step *is* the success signal.
+          command: echo "Required jobs completed successfully!"
+
+  # =========================================================================
+  # deflake.yml :: deflake
+  # =========================================================================
+  deflake:
+    executor:
+      name: jdk
+      java: << pipeline.parameters.deflake-java-version >>
+      size: xlarge
+    environment:
+      TEST_MODULE: << pipeline.parameters.deflake-test-module >>
+      TEST_PATTERN: << pipeline.parameters.deflake-test-pattern >>
+      TEST_REPEAT: << pipeline.parameters.deflake-test-repeat >>
+      TIMEOUT_MINUTES: "60"
+      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      GITHUB_WORKSPACE: /home/circleci/project
+    steps:
+      - checkout
+      - setup-python
+      # deflake.yml set gradle-cache-read-only: true unconditionally, so this is
+      # a bare restore with no matching save. The prefix picks up whichever
+      # `test-<java>-*` cache exists for the requested JDK.
+      - restore_cache:
+          keys:
+            - gradle-home-v1-{{ arch }}-test-<< pipeline.parameters.deflake-java-version >>-false-false-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}-
+            - gradle-home-v1-{{ arch }}-test-<< pipeline.parameters.deflake-java-version >>-
+            - gradle-home-v1-{{ arch }}-test-
+      - run:
+          name: Test
+          no_output_timeout: 70m
+          command: |
+            set +e
+            ./.github/scripts/thread-dump.sh &
+            timeout 60m ./gradlew --info --build-cache --scan --continue \
+              -PtestLoggingEvents=started,passed,skipped,failed \
+              -PmaxParallelForks=2 \
+              -Pkafka.cluster.test.repeat="$TEST_REPEAT" \
+              -PmaxTestRetries="$TEST_REPEAT" -PmaxTestRetryFailures=0 \
+              "${TEST_MODULE}:test" --tests "$TEST_PATTERN"
+            echo "$?" > /tmp/gradle-test-exitcode
+            cat /tmp/gradle-test-exitcode
+      - store_test_results:
+          when: always
+          path: build/junit-xml
+      - store-html-reports:
+          pattern: "*/build/reports/tests/*"
+          destination: junit-html-reports
+          stage-dir: /tmp/junit-html
+      - run:
+          name: Archive JUnit XML
+          when: always
+          command: |
+            mkdir -p /tmp/junit-xml
+            if [ -d build/junit-xml ]; then cp -R build/junit-xml/. /tmp/junit-xml/; fi
+      - store_artifacts:
+          when: always
+          path: /tmp/junit-xml
+          destination: junit-xml
+      - run:
+          name: Archive Thread Dumps
+          when: always
+          command: |
+            mkdir -p /tmp/thread-dumps
+            code=$(cat /tmp/gradle-test-exitcode 2>/dev/null || echo 0)
+            if [ "$code" = "124" ] && [ -d thread-dumps ]; then
+              cp -R thread-dumps/. /tmp/thread-dumps/
+            fi
+      - store_artifacts:
+          when: always
+          path: /tmp/thread-dumps
+          destination: junit-thread-dumps
+      - run:
+          name: Parse JUnit tests
+          when: always
+          command: |
+            GRADLE_TEST_EXIT_CODE=$(cat /tmp/gradle-test-exitcode 2>/dev/null || echo 0)
+            export GRADLE_TEST_EXIT_CODE
+            JUNIT_REPORT_URL="${CIRCLE_BUILD_URL}/artifacts"
+            export JUNIT_REPORT_URL
+            THREAD_DUMP_URL="${CIRCLE_BUILD_URL}/artifacts"
+            export THREAD_DUMP_URL
+            python3 .github/scripts/junit.py --path build/junit-xml || true
+
+  # =========================================================================
+  # docker_build_and_test.yml :: build
+  # =========================================================================
+  docker-build-and-test:
+    executor: linux-machine
+    environment:
+      IMAGE_TYPE: << pipeline.parameters.docker-image-type >>
+      KAFKA_URL: << pipeline.parameters.docker-kafka-url >>
+    steps:
+      - checkout
+      - run:
+          name: Validate inputs
+          command: |
+            if [ -z "$KAFKA_URL" ]; then
+              echo "docker-kafka-url pipeline parameter is required" >&2
+              exit 1
+            fi
+      - run:
+          # GHA pinned CPython 3.10 with actions/setup-python. The Ubuntu machine
+          # image ships a newer interpreter and marks it externally managed
+          # (PEP 668), so we install docker/requirements.txt into a virtualenv
+          # and put it on PATH. docker/requirements.txt pins no Python version.
+          name: Set up Python and Docker Compose
+          command: |
+            python3 -m venv /tmp/docker-venv
+            echo 'export PATH="/tmp/docker-venv/bin:$PATH"' >> "$BASH_ENV"
+            /tmp/docker-venv/bin/python -m pip install --upgrade pip
+            /tmp/docker-venv/bin/python -m pip install -r docker/requirements.txt
+            /tmp/docker-venv/bin/python --version
+            docker compose version
+      - run:
+          name: Build image and run tests
+          working_directory: ~/project/docker
+          no_output_timeout: 40m
+          command: |
+            python docker_build_test.py kafka/test -tag=test "-type=$IMAGE_TYPE" "-u=$KAFKA_URL"
+      # lhotari/sandboxed-trivy-action has no CircleCI equivalent; run the
+      # upstream Trivy image directly against the local Docker daemon.
+      - run:
+          name: Run CVE scan
+          when: always
+          command: |
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:latest image \
+              --format table \
+              --severity CRITICAL,HIGH \
+              --exit-code 1 \
+              kafka/test:test | tee "scan_report_${IMAGE_TYPE}.txt"
+      - run:
+          name: Stage reports
+          when: always
+          command: |
+            mkdir -p /tmp/docker-reports
+            cp "scan_report_${IMAGE_TYPE}.txt" /tmp/docker-reports/ 2>/dev/null || true
+            cp "docker/test/report_${IMAGE_TYPE}.html" /tmp/docker-reports/ 2>/dev/null || true
+      - store_artifacts:
+          when: always
+          path: /tmp/docker-reports
+          destination: docker-reports
+
+  # =========================================================================
+  # docker_official_image_build_and_test.yml :: build
+  # =========================================================================
+  docker-official-image-build-and-test:
+    executor: linux-machine
+    environment:
+      # This workflow only ever offered "jvm" in its choice input.
+      IMAGE_TYPE: "jvm"
+      KAFKA_VERSION: << pipeline.parameters.docker-kafka-version >>
+    steps:
+      - checkout
+      - run:
+          name: Validate inputs
+          command: |
+            if [ -z "$KAFKA_VERSION" ]; then
+              echo "docker-kafka-version pipeline parameter is required (>=3.7.0)" >&2
+              exit 1
+            fi
+      - run:
+          # GHA pinned CPython 3.10 with actions/setup-python. The Ubuntu machine
+          # image ships a newer interpreter and marks it externally managed
+          # (PEP 668), so we install docker/requirements.txt into a virtualenv
+          # and put it on PATH. docker/requirements.txt pins no Python version.
+          name: Set up Python and Docker Compose
+          command: |
+            python3 -m venv /tmp/docker-venv
+            echo 'export PATH="/tmp/docker-venv/bin:$PATH"' >> "$BASH_ENV"
+            /tmp/docker-venv/bin/python -m pip install --upgrade pip
+            /tmp/docker-venv/bin/python -m pip install -r docker/requirements.txt
+            /tmp/docker-venv/bin/python --version
+            docker compose version
+      - run:
+          name: Build image and run tests
+          working_directory: ~/project/docker
+          no_output_timeout: 40m
+          command: |
+            python docker_official_image_build_test.py kafka/test -tag=test "-type=$IMAGE_TYPE" "-v=$KAFKA_VERSION"
+      - run:
+          name: Run CVE scan
+          when: always
+          command: |
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:latest image \
+              --format table \
+              --severity CRITICAL,HIGH \
+              --exit-code 1 \
+              kafka/test:test | tee "scan_report_${IMAGE_TYPE}.txt"
+      - run:
+          name: Stage reports
+          when: always
+          command: |
+            mkdir -p /tmp/docker-reports
+            cp "scan_report_${IMAGE_TYPE}.txt" /tmp/docker-reports/ 2>/dev/null || true
+            cp "docker/test/report_${IMAGE_TYPE}.html" /tmp/docker-reports/ 2>/dev/null || true
+      - store_artifacts:
+          when: always
+          path: /tmp/docker-reports
+          destination: docker-reports
+
+  # =========================================================================
+  # prepare_docker_official_image_source.yml :: build
+  # =========================================================================
+  prepare-docker-official-image-source:
+    executor: python
+    environment:
+      IMAGE_TYPE: "jvm"
+      KAFKA_VERSION: << pipeline.parameters.docker-kafka-version >>
+    steps:
+      - checkout
+      - run:
+          name: Validate inputs
+          command: |
+            if [ -z "$KAFKA_VERSION" ]; then
+              echo "docker-kafka-version pipeline parameter is required (>=3.7.0)" >&2
+              exit 1
+            fi
+      - setup-python:
+          requirements: docker/requirements.txt
+      - run:
+          name: Build Docker Official Image Artifact
+          working_directory: ~/project/docker
+          command: |
+            python prepare_docker_official_image_source.py "-type=$IMAGE_TYPE" "-v=$KAFKA_VERSION"
+      # GHA guarded this upload with `if: success()`; the directory only exists
+      # once the generator has run.
+      - store_artifacts:
+          path: docker/docker_official_images
+          destination: docker-official-images
+
+  # =========================================================================
+  # docker_scan.yml :: scan_jvm  (matrix over the supported image tags)
+  # =========================================================================
+  docker-scan:
+    parameters:
+      image-tag:
+        type: string
+    executor: linux-machine
+    environment:
+      IMAGE_TAG: << parameters.image-tag >>
+    steps:
+      - run:
+          name: Only scan for the canonical project
+          # GHA guarded this with `if: github.repository == 'apache/kafka'`
+          command: |
+            if [ "${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}" != "apache/kafka" ]; then
+              echo "Skipping CVE scan for ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+              circleci-agent step halt
+            fi
+      - run:
+          name: Run CVE scan
+          command: |
+            mkdir -p /tmp/scan-reports
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:latest image \
+              --format table \
+              --severity CRITICAL,HIGH \
+              --exit-code 1 \
+              "apache/kafka:${IMAGE_TAG}" \
+              | tee "/tmp/scan-reports/scan_report_jvm_${IMAGE_TAG}.txt"
+      - store_artifacts:
+          when: always
+          path: /tmp/scan-reports
+          destination: scan-reports
+
+  # =========================================================================
+  # generate-reports.yml :: flaky-test-report
+  # =========================================================================
+  flaky-test-report:
+    executor: python
+    steps:
+      - run:
+          name: Env
+          command: printenv | sort
+      - checkout
+      - setup-python
+      - run:
+          name: Run Report
+          # Requires the DEVELOCITY_ACCESS_TOKEN project environment variable
+          # (GHA read it from secrets.KAFKA_DEVELOCITY_ACCESS_KEY).
+          command: |
+            if [ -z "${DEVELOCITY_ACCESS_TOKEN:-}" ]; then
+              echo "DEVELOCITY_ACCESS_TOKEN is not set; skipping the flaky test report" >&2
+              circleci-agent step halt
+            fi
+            mkdir -p /tmp/reports
+            python ./.github/scripts/develocity_reports.py | tee /tmp/reports/flaky-test-report.md
+      - store_artifacts:
+          when: always
+          path: /tmp/reports
+          destination: reports
+
+  # =========================================================================
+  # pr-linter.yml :: lint-pr
+  # =========================================================================
+  pr-lint:
+    executor: python
+    steps:
+      - checkout
+      - run:
+          name: Lint PR title and body
+          # GHA fed the PR number through an artifact produced by pr-reviewed.yml.
+          # CircleCI exposes it directly on the build, so no hand-off is needed.
+          # Requires GITHUB_TOKEN as a project environment variable and the
+          # GitHub CLI. Note that .github/scripts/pr-format.py only rewrites the
+          # PR body when GITHUB_ACTIONS is set, so under CircleCI it lints only.
+          command: |
+            if [ -z "${CIRCLE_PULL_REQUEST:-}" ]; then
+              echo "Not a pull request build; nothing to lint"
+              circleci-agent step halt
+            fi
+            if [ -z "${GITHUB_TOKEN:-}" ]; then
+              echo "GITHUB_TOKEN is not set; cannot query the pull request" >&2
+              circleci-agent step halt
+            fi
+            if ! command -v gh >/dev/null 2>&1; then
+              curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+                | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends gh
+            fi
+            GH_TOKEN="$GITHUB_TOKEN"
+            export GH_TOKEN
+            PR_NUMBER="${CIRCLE_PULL_REQUEST##*/}"
+            export PR_NUMBER
+            python .github/scripts/pr-format.py
+
+# ---------------------------------------------------------------------------
+# Workflows
+# ---------------------------------------------------------------------------
+workflows:
+  # ci.yml -> build.yml, non-draft pull requests and branch pushes
+  ci:
+    when:
+      and:
+        - << pipeline.parameters.run-ci >>
+        - not: << pipeline.parameters.is-draft >>
+    jobs:
+      - load-catalog
+      - validate
+      - test:
+          requires:
+            - validate
+            - load-catalog
+          matrix:
+            parameters:
+              java: ["25", "17"]
+              run-flaky: [true, false]
+              run-new: [true, false]
+            # build.yml excluded the flaky+new combination for both JDKs.
+            exclude:
+              - java: "25"
+                run-flaky: true
+                run-new: true
+              - java: "17"
+                run-flaky: true
+                run-new: true
+      - collate-test-catalog:
+          requires:
+            - test-25-true-false
+            - test-25-false-true
+            - test-25-false-false
+            - test-17-true-false
+            - test-17-false-true
+            - test-17-false-false
+      - update-test-catalog:
+          requires:
+            - collate-test-catalog
+          filters:
+            branches:
+              only: trunk
+      - checks-complete:
+          fail-if-draft: false
+          requires:
+            - validate
+            - test-25-true-false
+            - test-25-false-true
+            - test-25-false-false
+            - test-17-true-false
+            - test-17-false-true
+            - test-17-false-false
+  # pr-linter.yml. GHA chained this off a separate "Pull Request Reviewed"
+  # workflow purely to move the PR number across a privilege boundary; CircleCI
+  # exposes CIRCLE_PULL_REQUEST directly, so it is an ordinary standalone job
+  # with no dependency on the build.
+  pr-checks:
+    when:
+      and:
+        - << pipeline.parameters.run-ci >>
+        - << pipeline.parameters.is-pull-request >>
+    jobs:
+      - pr-lint
+
+  # ci.yml -> build.yml, draft pull requests.
+  # build.yml skipped the `test` matrix for drafts and then failed
+  # `checks-complete` so the PR could not be merged.
+  ci-draft:
+    when:
+      and:
+        - << pipeline.parameters.run-ci >>
+        - << pipeline.parameters.is-draft >>
+    jobs:
+      - load-catalog
+      - validate
+      - checks-complete:
+          fail-if-draft: true
+          requires:
+            - validate
+
+  deflake:
+    when: << pipeline.parameters.run-deflake >>
+    jobs:
+      - deflake
+
+  docker-build-test:
+    when: << pipeline.parameters.run-docker-build-test >>
+    jobs:
+      - docker-build-and-test
+
+  docker-official-image-build-test:
+    when: << pipeline.parameters.run-docker-official-image-build-test >>
+    jobs:
+      - docker-official-image-build-and-test
+
+  prepare-docker-official-image-source:
+    when: << pipeline.parameters.run-prepare-docker-official-image-source >>
+    jobs:
+      - prepare-docker-official-image-source
+
+  docker-scan:
+    when: << pipeline.parameters.run-docker-scan >>
+    jobs:
+      - docker-scan:
+          matrix:
+            parameters:
+              # Keep in sync with the `supported_image_tag` matrix in
+              # .github/workflows/docker_scan.yml
+              image-tag: ["latest", "3.9.2", "4.0.2", "4.1.2", "4.2.1", "4.3.1"]
+
+  flaky-test-report:
+    when: << pipeline.parameters.run-flaky-test-report >>
+    jobs:
+      - flaky-test-report
