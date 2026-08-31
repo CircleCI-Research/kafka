@@ -189,7 +189,13 @@ commands:
               sudo apt-get update -qq
               sudo apt-get install -y --no-install-recommends python3 python3-venv
             fi
-            if ! python3 -m venv --help >/dev/null 2>&1; then
+            # Probe for `ensurepip`, not for the venv module. `python3 -m venv
+            # --help` succeeds even when a venv cannot actually be created:
+            # venv is stdlib, but Debian and Ubuntu package ensurepip
+            # separately as python3-venv. The first pipeline passed this guard
+            # and then died on "The virtual environment was not created
+            # successfully because ensurepip is not available".
+            if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
               sudo apt-get update -qq
               sudo apt-get install -y --no-install-recommends python3-venv
             fi
