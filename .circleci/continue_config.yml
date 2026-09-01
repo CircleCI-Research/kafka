@@ -533,7 +533,17 @@ jobs:
           no_output_timeout: 220m
           command: |
             set +e
+            # thread-dump.sh is a watchdog: it sleeps until five minutes before
+            # the timeout, then dumps threads so a hung build leaves evidence.
+            # The source backgrounds it and never kills it, which is harmless on
+            # GitHub Actions because the runner tears down the step's process
+            # group when the main command returns. CircleCI instead waits for
+            # the step's output stream to close, so the orphaned `sleep` held
+            # every test job open for hours after Gradle had already finished --
+            # BUILD SUCCESSFUL in 5m, step still running at 56m. Track the pid
+            # and reap it once Gradle returns.
             ./.github/scripts/thread-dump.sh &
+            DUMP_PID=$!
             timeout ${TIMEOUT_MINUTES}m ./gradlew --build-cache --continue "$SCAN_ARG" \
               -PtestLoggingEvents=started,passed,skipped,failed \
               -PmaxParallelForks=4 \
@@ -549,6 +559,8 @@ jobs:
               -x spotbugsTest \
               test
             echo "$?" > /tmp/gradle-test-exitcode
+            kill "$DUMP_PID" 2>/dev/null
+            wait "$DUMP_PID" 2>/dev/null
             cat /tmp/gradle-test-exitcode
       - save-gradle-cache:
           scope: test-<< parameters.java >>-<< parameters.run-flaky >>-<< parameters.run-new >>
@@ -825,6 +837,8 @@ jobs:
               -PmaxTestRetries="$TEST_REPEAT" -PmaxTestRetryFailures=0 \
               "${TEST_MODULE}:test" --tests "$TEST_PATTERN"
             echo "$?" > /tmp/gradle-test-exitcode
+            kill "$DUMP_PID" 2>/dev/null
+            wait "$DUMP_PID" 2>/dev/null
             cat /tmp/gradle-test-exitcode
       - store_test_results:
           when: always
