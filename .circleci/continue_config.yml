@@ -525,6 +525,24 @@ jobs:
               echo "WARNING: no test catalog available; continuing without one" >&2
               : > ./combined-test-catalog.txt
             fi
+      # A run-new leg cannot do its job without a catalog.
+      # KafkaPostDiscoveryFilter documents that "if no test catalog is given, or
+      # it is empty/invalid, kafka.test.run.new will not select any tests" -- so
+      # the leg compiles everything, runs nothing, and reports green. A job with
+      # no usable input must fail rather than pass vacuously. Gated with `when`
+      # rather than a shell test on the parameter, which would compile to
+      # `if [ "false" = "true" ]` in the four legs that do not need it.
+      - when:
+          condition: << parameters.run-new >>
+          steps:
+            - run:
+                name: Require a usable test catalog
+                command: |
+                  if [ ! -s ./combined-test-catalog.txt ]; then
+                    echo "run-new requires a non-empty test catalog; refusing to" \
+                         "report green on zero selected tests" >&2
+                    exit 1
+                  fi
       # Ordering invariant: thread-dump.sh must be backgrounded *before* the
       # gradle invocation. It sleeps (TIMEOUT_MINUTES - 5) and then jstacks the
       # Gradle workers, so starting it afterwards would never fire.
@@ -542,7 +560,13 @@ jobs:
             # every test job open for hours after Gradle had already finished --
             # BUILD SUCCESSFUL in 5m, step still running at 56m. Track the pid
             # and reap it once Gradle returns.
-            ./.github/scripts/thread-dump.sh &
+            # Redirect the watchdog's output to a file. A backgrounded
+            # process that inherits the step's stdout keeps CircleCI waiting
+            # for that stream to close even after the step's own command has
+            # returned -- which is why every test job sat idle for hours after
+            # "BUILD SUCCESSFUL in 5m". The dumps themselves are written to
+            # thread-dumps/, so only progress chatter moves to the log file.
+            ./.github/scripts/thread-dump.sh > /tmp/thread-dump.log 2>&1 &
             DUMP_PID=$!
             timeout ${TIMEOUT_MINUTES}m ./gradlew --build-cache --continue "$SCAN_ARG" \
               -PtestLoggingEvents=started,passed,skipped,failed \
@@ -559,6 +583,10 @@ jobs:
               -x spotbugsTest \
               test
             echo "$?" > /tmp/gradle-test-exitcode
+            # Kill the children first: `sleep` is a child of thread-dump.sh,
+            # so killing only $DUMP_PID orphans it and the orphan keeps
+            # running. That is why the previous attempt at this did not work.
+            pkill -P "$DUMP_PID" 2>/dev/null
             kill "$DUMP_PID" 2>/dev/null
             wait "$DUMP_PID" 2>/dev/null
             cat /tmp/gradle-test-exitcode
@@ -829,7 +857,14 @@ jobs:
           no_output_timeout: 70m
           command: |
             set +e
-            ./.github/scripts/thread-dump.sh &
+            # Redirect the watchdog's output to a file. A backgrounded
+            # process that inherits the step's stdout keeps CircleCI waiting
+            # for that stream to close even after the step's own command has
+            # returned -- which is why every test job sat idle for hours after
+            # "BUILD SUCCESSFUL in 5m". The dumps themselves are written to
+            # thread-dumps/, so only progress chatter moves to the log file.
+            ./.github/scripts/thread-dump.sh > /tmp/thread-dump.log 2>&1 &
+            DUMP_PID=$!
             timeout 60m ./gradlew --info --build-cache --scan --continue \
               -PtestLoggingEvents=started,passed,skipped,failed \
               -PmaxParallelForks=2 \
@@ -837,6 +872,10 @@ jobs:
               -PmaxTestRetries="$TEST_REPEAT" -PmaxTestRetryFailures=0 \
               "${TEST_MODULE}:test" --tests "$TEST_PATTERN"
             echo "$?" > /tmp/gradle-test-exitcode
+            # Kill the children first: `sleep` is a child of thread-dump.sh,
+            # so killing only $DUMP_PID orphans it and the orphan keeps
+            # running. That is why the previous attempt at this did not work.
+            pkill -P "$DUMP_PID" 2>/dev/null
             kill "$DUMP_PID" 2>/dev/null
             wait "$DUMP_PID" 2>/dev/null
             cat /tmp/gradle-test-exitcode
