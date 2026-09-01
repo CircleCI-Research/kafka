@@ -292,11 +292,27 @@ jobs:
       - run:
           name: Checkout test-catalog branch
           command: |
-            git fetch --depth=100 origin test-catalog:refs/remotes/origin/test-catalog
-            git worktree add --detach test-catalog origin/test-catalog
+            # build.yml assumes the test-catalog branch exists, because on
+            # apache/kafka it always does. A fork -- which is what a migration
+            # is usually set up on first -- may not carry it, and a hard failure
+            # here blocks the whole test matrix through `requires: load-catalog`.
+            # The rest of this job is already built to survive an unusable
+            # catalog (see "Combine Catalog" below, which writes an empty file
+            # and lets downstream treat every test as new); this extends that
+            # same tolerance to the branch being absent.
+            if git fetch --depth=100 origin test-catalog:refs/remotes/origin/test-catalog 2>/dev/null; then
+              git worktree add --detach test-catalog origin/test-catalog
+            else
+              echo "WARNING: no test-catalog branch on this remote;" \
+                   "downstream jobs will treat every test as new" >&2
+            fi
       - run:
           name: Checkout catalog at earlier date
           command: |
+            if [ ! -d test-catalog ]; then
+              echo "No test-catalog checkout; nothing to rewind"
+              exit 0
+            fi
             if [ "$DAYS" = "0" ]; then
               echo "Pull request build: using the tip of test-catalog"
               exit 0
