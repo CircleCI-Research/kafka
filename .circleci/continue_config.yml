@@ -630,11 +630,35 @@ jobs:
             : > /tmp/sampler.on
             timeout 45m bash -c '
               i=0
+              dumps=0
               while [ -e /tmp/sampler.on ]; do
                 if [ $((i % 12)) -eq 0 ]; then
                   echo "=== SAMPLE $(date -u +%H:%M:%S) ==="
                   ps -eo pid,ppid,etime,rss,args 2>/dev/null \
                     | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
+                fi
+                # Thread-dump the launcher and the JVM it forked, at five
+                # minute marks, at most four times. The question these answer
+                # is the only one left: what call is the launcher parked on
+                # after the build has already reported success. The existing
+                # watchdog cannot answer it -- thread-dump.sh targets only
+                # GradleWorkerMain and does not fire until TIMEOUT_MINUTES-5,
+                # i.e. 205 minutes, because upstream it is aimed at a build
+                # that hangs *during* work rather than after finishing.
+                #
+                # Keyed off gradle-wrapper.jar, which matches the launcher and
+                # not the `timeout ... ./gradlew` wrapper around it.
+                if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
+                  launcher=$(pgrep -f gradle-wrapper.jar 2>/dev/null | head -1)
+                  if [ -n "$launcher" ]; then
+                    for pid in "$launcher" $(pgrep -P "$launcher" 2>/dev/null); do
+                      echo "=== JSTACK pid $pid at $(date -u +%H:%M:%S) ==="
+                      jstack "$pid" 2>&1 | head -400
+                    done
+                    dumps=$((dumps+1))
+                  else
+                    echo "=== JSTACK skipped: no gradle-wrapper.jar process ==="
+                  fi
                 fi
                 i=$((i+1))
                 sleep 5
@@ -984,11 +1008,35 @@ jobs:
             : > /tmp/sampler.on
             timeout 45m bash -c '
               i=0
+              dumps=0
               while [ -e /tmp/sampler.on ]; do
                 if [ $((i % 12)) -eq 0 ]; then
                   echo "=== SAMPLE $(date -u +%H:%M:%S) ==="
                   ps -eo pid,ppid,etime,rss,args 2>/dev/null \
                     | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
+                fi
+                # Thread-dump the launcher and the JVM it forked, at five
+                # minute marks, at most four times. The question these answer
+                # is the only one left: what call is the launcher parked on
+                # after the build has already reported success. The existing
+                # watchdog cannot answer it -- thread-dump.sh targets only
+                # GradleWorkerMain and does not fire until TIMEOUT_MINUTES-5,
+                # i.e. 205 minutes, because upstream it is aimed at a build
+                # that hangs *during* work rather than after finishing.
+                #
+                # Keyed off gradle-wrapper.jar, which matches the launcher and
+                # not the `timeout ... ./gradlew` wrapper around it.
+                if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
+                  launcher=$(pgrep -f gradle-wrapper.jar 2>/dev/null | head -1)
+                  if [ -n "$launcher" ]; then
+                    for pid in "$launcher" $(pgrep -P "$launcher" 2>/dev/null); do
+                      echo "=== JSTACK pid $pid at $(date -u +%H:%M:%S) ==="
+                      jstack "$pid" 2>&1 | head -400
+                    done
+                    dumps=$((dumps+1))
+                  else
+                    echo "=== JSTACK skipped: no gradle-wrapper.jar process ==="
+                  fi
                 fi
                 i=$((i+1))
                 sleep 5
