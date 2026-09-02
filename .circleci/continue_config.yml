@@ -287,6 +287,17 @@ jobs:
       size: medium
     environment:
       DAYS: << pipeline.parameters.test-catalog-days >>
+      # format-test-catalog.py exits 1 with "This script is intended to be run
+      # by GitHub Actions." unless GITHUB_WORKSPACE is set. It is the only
+      # thing the script checks and it never reads the value, so any absolute
+      # path satisfies it. Four other jobs here already set this for
+      # checkstyle.py, rat.py and junit.py; this job was the one that missed
+      # it, and the miss was invisible because the step that calls the script
+      # is deliberately tolerant to mirror `continue-on-error: true`. So the
+      # script refused to run, the wrapper wrote an empty catalog, and every
+      # run-new leg then selected zero tests -- which without the guard below
+      # would have been reported as green.
+      GITHUB_WORKSPACE: /home/circleci/project
     steps:
       - checkout
       - run:
@@ -560,15 +571,32 @@ jobs:
             # every test job open for hours after Gradle had already finished --
             # BUILD SUCCESSFUL in 5m, step still running at 56m. Track the pid
             # and reap it once Gradle returns.
-            # Redirect the watchdog's output to a file. A backgrounded
-            # process that inherits the step's stdout keeps CircleCI waiting
-            # for that stream to close even after the step's own command has
-            # returned -- which is why every test job sat idle for hours after
-            # "BUILD SUCCESSFUL in 5m". The dumps themselves are written to
-            # thread-dumps/, so only progress chatter moves to the log file.
+            # The watchdog's output goes to a file, not the step's stdout: a
+            # backgrounded process holding that stream would keep CircleCI
+            # waiting even after the step's command returned. That turned out
+            # not to be what hung these jobs (see the reap below), but it is
+            # still required, because the reap can leave an orphaned `sleep`.
+            # The dumps themselves are written to thread-dumps/, so only
+            # progress chatter moves to the log file.
             ./.github/scripts/thread-dump.sh > /tmp/thread-dump.log 2>&1 &
             DUMP_PID=$!
+            # --max-workers is pinned to the source runner's CPU count rather
+            # than left to Gradle. gradle.properties sets
+            # org.gradle.parallel=true, so Gradle sizes its worker pool from
+            # the CPUs it can see, and each worker can fork up to
+            # maxParallelForks=4 test JVMs against a single 16 GB budget.
+            #
+            # ubuntu-latest is 4 CPU / 16 GB. There is no 4 CPU / 16 GB docker
+            # class: `large` is 4/8 and `xlarge` is 8/16. Matching GitHub on
+            # memory therefore doubles the CPUs, which doubled Gradle's
+            # parallelism inside the same memory -- so raising the resource
+            # class is what caused the OOM, not what relieved it. The kernel
+            # killed the JVM and Gradle reported "Gradle build daemon
+            # disappeared unexpectedly (it may have been killed or may have
+            # crashed)", which reads like a Gradle bug rather than a sizing
+            # one, and left the leg with 0 tests run.
             timeout ${TIMEOUT_MINUTES}m ./gradlew --build-cache --continue "$SCAN_ARG" \
+              --max-workers=4 \
               -PtestLoggingEvents=started,passed,skipped,failed \
               -PmaxParallelForks=4 \
               -PmaxTestRetries="$TEST_RETRIES" -PmaxTestRetryFailures=10 \
@@ -583,12 +611,48 @@ jobs:
               -x spotbugsTest \
               test
             echo "$?" > /tmp/gradle-test-exitcode
-            # Kill the children first: `sleep` is a child of thread-dump.sh,
-            # so killing only $DUMP_PID orphans it and the orphan keeps
-            # running. That is why the previous attempt at this did not work.
-            pkill -P "$DUMP_PID" 2>/dev/null
-            kill "$DUMP_PID" 2>/dev/null
-            wait "$DUMP_PID" 2>/dev/null
+            # INSTRUMENTED REAP.
+            #
+            # Two previous fixes here were wrong, so this run is built to
+            # localise the hang rather than to guess at it again. What is
+            # known: on run-flaky=true legs Gradle prints "BUILD SUCCESSFUL
+            # in 6m 48s / 383 actionable tasks: 383 executed" and the step
+            # then sits until cancelled -- at 17m51s in the last run --
+            # without ever printing the exit code at the end of this block.
+            # On run-flaky=false legs the same block completes and the job
+            # goes on to finish every later step. So the script is blocking
+            # somewhere between Gradle returning and the final `cat`, and
+            # only when flaky tests ran.
+            #
+            # Ruled out by direct test rather than argument:
+            #   * `wait` deferring SIGTERM. Reproduced locally: a bash script
+            #     sitting in a foreground `sleep` dies on SIGTERM at once
+            #     when no trap is installed, and `kill` + `wait` returned in
+            #     2s. Signal deferral applies to trapped signals only.
+            #   * Publishing a build scan. The source passes --no-scan and so
+            #     does this config: gradle-scan-arg defaults to "--no-scan".
+            #
+            # The markers below name whichever statement blocks, and the two
+            # process listings name any survivor holding the step's stdout,
+            # which is the remaining candidate: flaky tests are exactly the
+            # ones that leak broker JVMs and GradleWorkerMain executors.
+            echo "REAP: gradle returned $(cat /tmp/gradle-test-exitcode)"
+            echo "REAP: processes before reap"
+            ps -ef 2>/dev/null || ps aux 2>/dev/null || true
+            echo "REAP: killing children of watchdog $DUMP_PID"
+            pkill -9 -P "$DUMP_PID" 2>/dev/null || true
+            echo "REAP: killing watchdog $DUMP_PID"
+            kill -9 "$DUMP_PID" 2>/dev/null || true
+            # Gradle has already returned, so any surviving test executor is
+            # a leak. These inherit the step's stdout, and CircleCI holds a
+            # step open until that stream closes -- unlike GitHub Actions,
+            # which tears down the step's process group and so never exposes
+            # the leak. Targeted at Gradle's executor main class rather than
+            # anything broader.
+            pkill -9 -f GradleWorkerMain 2>/dev/null || true
+            echo "REAP: processes after reap"
+            ps -ef 2>/dev/null || ps aux 2>/dev/null || true
+            echo "REAP: complete"
             cat /tmp/gradle-test-exitcode
       - save-gradle-cache:
           scope: test-<< parameters.java >>-<< parameters.run-flaky >>-<< parameters.run-new >>
@@ -857,12 +921,13 @@ jobs:
           no_output_timeout: 70m
           command: |
             set +e
-            # Redirect the watchdog's output to a file. A backgrounded
-            # process that inherits the step's stdout keeps CircleCI waiting
-            # for that stream to close even after the step's own command has
-            # returned -- which is why every test job sat idle for hours after
-            # "BUILD SUCCESSFUL in 5m". The dumps themselves are written to
-            # thread-dumps/, so only progress chatter moves to the log file.
+            # The watchdog's output goes to a file, not the step's stdout: a
+            # backgrounded process holding that stream would keep CircleCI
+            # waiting even after the step's command returned. That turned out
+            # not to be what hung these jobs (see the reap below), but it is
+            # still required, because the reap can leave an orphaned `sleep`.
+            # The dumps themselves are written to thread-dumps/, so only
+            # progress chatter moves to the log file.
             ./.github/scripts/thread-dump.sh > /tmp/thread-dump.log 2>&1 &
             DUMP_PID=$!
             timeout 60m ./gradlew --info --build-cache --scan --continue \
@@ -872,12 +937,48 @@ jobs:
               -PmaxTestRetries="$TEST_REPEAT" -PmaxTestRetryFailures=0 \
               "${TEST_MODULE}:test" --tests "$TEST_PATTERN"
             echo "$?" > /tmp/gradle-test-exitcode
-            # Kill the children first: `sleep` is a child of thread-dump.sh,
-            # so killing only $DUMP_PID orphans it and the orphan keeps
-            # running. That is why the previous attempt at this did not work.
-            pkill -P "$DUMP_PID" 2>/dev/null
-            kill "$DUMP_PID" 2>/dev/null
-            wait "$DUMP_PID" 2>/dev/null
+            # INSTRUMENTED REAP.
+            #
+            # Two previous fixes here were wrong, so this run is built to
+            # localise the hang rather than to guess at it again. What is
+            # known: on run-flaky=true legs Gradle prints "BUILD SUCCESSFUL
+            # in 6m 48s / 383 actionable tasks: 383 executed" and the step
+            # then sits until cancelled -- at 17m51s in the last run --
+            # without ever printing the exit code at the end of this block.
+            # On run-flaky=false legs the same block completes and the job
+            # goes on to finish every later step. So the script is blocking
+            # somewhere between Gradle returning and the final `cat`, and
+            # only when flaky tests ran.
+            #
+            # Ruled out by direct test rather than argument:
+            #   * `wait` deferring SIGTERM. Reproduced locally: a bash script
+            #     sitting in a foreground `sleep` dies on SIGTERM at once
+            #     when no trap is installed, and `kill` + `wait` returned in
+            #     2s. Signal deferral applies to trapped signals only.
+            #   * Publishing a build scan. The source passes --no-scan and so
+            #     does this config: gradle-scan-arg defaults to "--no-scan".
+            #
+            # The markers below name whichever statement blocks, and the two
+            # process listings name any survivor holding the step's stdout,
+            # which is the remaining candidate: flaky tests are exactly the
+            # ones that leak broker JVMs and GradleWorkerMain executors.
+            echo "REAP: gradle returned $(cat /tmp/gradle-test-exitcode)"
+            echo "REAP: processes before reap"
+            ps -ef 2>/dev/null || ps aux 2>/dev/null || true
+            echo "REAP: killing children of watchdog $DUMP_PID"
+            pkill -9 -P "$DUMP_PID" 2>/dev/null || true
+            echo "REAP: killing watchdog $DUMP_PID"
+            kill -9 "$DUMP_PID" 2>/dev/null || true
+            # Gradle has already returned, so any surviving test executor is
+            # a leak. These inherit the step's stdout, and CircleCI holds a
+            # step open until that stream closes -- unlike GitHub Actions,
+            # which tears down the step's process group and so never exposes
+            # the leak. Targeted at Gradle's executor main class rather than
+            # anything broader.
+            pkill -9 -f GradleWorkerMain 2>/dev/null || true
+            echo "REAP: processes after reap"
+            ps -ef 2>/dev/null || ps aux 2>/dev/null || true
+            echo "REAP: complete"
             cat /tmp/gradle-test-exitcode
       - store_test_results:
           when: always
