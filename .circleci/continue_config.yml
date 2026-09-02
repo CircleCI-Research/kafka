@@ -366,7 +366,9 @@ jobs:
       size: xlarge
     environment:
       SCAN_ARG: << pipeline.parameters.gradle-scan-arg >>
-      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      # Deliberately NO `GRADLE_OPTS: -Dorg.gradle.daemon=false`; please do not
+      # re-add it. See the explanation on the `test` job below -- it is not
+      # what the source does, and it hangs the step after a successful build.
       # .github/scripts/checkstyle.py and rat.py both read GITHUB_WORKSPACE to
       # turn absolute report paths into repo-relative ones.
       GITHUB_WORKSPACE: /home/circleci/project
@@ -459,7 +461,28 @@ jobs:
     environment:
       SCAN_ARG: << pipeline.parameters.gradle-scan-arg >>
       TIMEOUT_MINUTES: "210"
-      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      # Deliberately NO `GRADLE_OPTS: -Dorg.gradle.daemon=false`. Please do
+      # not re-add it: disabling the daemon is conventional CI advice, but it
+      # is not what the source does -- nothing in .github/ or gradle.properties
+      # disables the daemon -- and here it hung every test job.
+      #
+      # gradle.properties sets org.gradle.jvmargs=-Xmx4g -Xss4m
+      # -XX:+UseParallelGC, which the 64 MB wrapper launcher JVM cannot honour.
+      # With the daemon disabled Gradle therefore forks a single-use daemon and
+      # waits on it as its own child. The build completed -- BUILD SUCCESSFUL
+      # in 4m 51s -- the forked JVM exited, and the launcher then never reaped
+      # it and never returned. Sampling the process tree during a hung step
+      # showed exactly three processes and no leaks:
+      #
+      #   736  733  timeout 210m ./gradlew ...
+      #   738  736  java -Xmx64m -Xms64m -Dorg.gradle.daemon=false ... wrapper
+      #   802  738  [java] <defunct>
+      #
+      # All four legs that reached BUILD SUCCESSFUL hung identically, which is
+      # what a launcher-level defect predicts and a leaked test process would
+      # not. With the daemon left enabled the client receives the build result
+      # and exits, and the daemon is detached rather than a child being waited
+      # on.
       GITHUB_WORKSPACE: /home/circleci/project
       # settings.gradle sets `uploadInBackground = !isGithubActions`, where
       # isGithubActions is just `System.getenv('GITHUB_ACTIONS') != null`.
@@ -916,7 +939,9 @@ jobs:
       TEST_PATTERN: << pipeline.parameters.deflake-test-pattern >>
       TEST_REPEAT: << pipeline.parameters.deflake-test-repeat >>
       TIMEOUT_MINUTES: "60"
-      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      # Deliberately NO `GRADLE_OPTS: -Dorg.gradle.daemon=false`; please do not
+      # re-add it. See the explanation on the `test` job below -- it is not
+      # what the source does, and it hangs the step after a successful build.
       GITHUB_WORKSPACE: /home/circleci/project
     steps:
       - checkout
