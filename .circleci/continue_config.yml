@@ -648,16 +648,45 @@ jobs:
                 #
                 # Keyed off gradle-wrapper.jar, which matches the launcher and
                 # not the `timeout ... ./gradlew` wrapper around it.
+                # PIDs come from jps, not pgrep. `pgrep -f gradle-wrapper.jar`
+                # matched this sampler itself, because the pattern is a literal
+                # inside the very script being searched -- the same trap as
+                # needing `grep -v grep`. It returned the step shell, timeout
+                # and the sampler, and every jstack failed with "HotSpot VM not
+                # loaded". jps only ever lists JVMs, so dump all of them and
+                # skip pattern matching entirely; at the hang that is the
+                # launcher, the JVM it forked, and any surviving worker.
                 if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
-                  launcher=$(pgrep -f gradle-wrapper.jar 2>/dev/null | head -1)
-                  if [ -n "$launcher" ]; then
-                    for pid in "$launcher" $(pgrep -P "$launcher" 2>/dev/null); do
-                      echo "=== JSTACK pid $pid at $(date -u +%H:%M:%S) ==="
-                      jstack "$pid" 2>&1 | head -400
+                  jvms=$(jps -q 2>/dev/null | tr "\n" " ")
+                  if [ -n "$jvms" ]; then
+                    echo "=== JSTACK round at $(date -u +%H:%M:%S); jvms: $jvms ==="
+                    jps -l 2>/dev/null || true
+                    for pid in $jvms; do
+                      echo "=== JSTACK pid $pid ==="
+                      # -l adds lock and ownable-synchronizer detail, and makes
+                      # jstack report "Found one Java-level deadlock" outright
+                      # if there is one.
+                      jstack -l "$pid" 2>&1 | head -500
+                    done
+                    # Gradle's own daemon log, which records shutdown activity
+                    # at a detail level independent of the console log level.
+                    # This is deliberately not solved by adding --info to the
+                    # build: validate carries --info and test does not, so the
+                    # two shutdown lines validate prints may be INFO-only and
+                    # absent from test for logging reasons rather than because
+                    # shutdown never got there. Raising the console level on a
+                    # test build would also produce enough output for CircleCI
+                    # to truncate the tail, which is precisely the part needed.
+                    echo "=== GRADLE DAEMON LOGS ==="
+                    ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
+                    for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
+                      [ -f "$log" ] || continue
+                      echo "--- tail of $log ---"
+                      tail -60 "$log" 2>/dev/null || true
                     done
                     dumps=$((dumps+1))
                   else
-                    echo "=== JSTACK skipped: no gradle-wrapper.jar process ==="
+                    echo "=== JSTACK skipped: jps reported no JVMs ==="
                   fi
                 fi
                 i=$((i+1))
@@ -1026,16 +1055,45 @@ jobs:
                 #
                 # Keyed off gradle-wrapper.jar, which matches the launcher and
                 # not the `timeout ... ./gradlew` wrapper around it.
+                # PIDs come from jps, not pgrep. `pgrep -f gradle-wrapper.jar`
+                # matched this sampler itself, because the pattern is a literal
+                # inside the very script being searched -- the same trap as
+                # needing `grep -v grep`. It returned the step shell, timeout
+                # and the sampler, and every jstack failed with "HotSpot VM not
+                # loaded". jps only ever lists JVMs, so dump all of them and
+                # skip pattern matching entirely; at the hang that is the
+                # launcher, the JVM it forked, and any surviving worker.
                 if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
-                  launcher=$(pgrep -f gradle-wrapper.jar 2>/dev/null | head -1)
-                  if [ -n "$launcher" ]; then
-                    for pid in "$launcher" $(pgrep -P "$launcher" 2>/dev/null); do
-                      echo "=== JSTACK pid $pid at $(date -u +%H:%M:%S) ==="
-                      jstack "$pid" 2>&1 | head -400
+                  jvms=$(jps -q 2>/dev/null | tr "\n" " ")
+                  if [ -n "$jvms" ]; then
+                    echo "=== JSTACK round at $(date -u +%H:%M:%S); jvms: $jvms ==="
+                    jps -l 2>/dev/null || true
+                    for pid in $jvms; do
+                      echo "=== JSTACK pid $pid ==="
+                      # -l adds lock and ownable-synchronizer detail, and makes
+                      # jstack report "Found one Java-level deadlock" outright
+                      # if there is one.
+                      jstack -l "$pid" 2>&1 | head -500
+                    done
+                    # Gradle's own daemon log, which records shutdown activity
+                    # at a detail level independent of the console log level.
+                    # This is deliberately not solved by adding --info to the
+                    # build: validate carries --info and test does not, so the
+                    # two shutdown lines validate prints may be INFO-only and
+                    # absent from test for logging reasons rather than because
+                    # shutdown never got there. Raising the console level on a
+                    # test build would also produce enough output for CircleCI
+                    # to truncate the tail, which is precisely the part needed.
+                    echo "=== GRADLE DAEMON LOGS ==="
+                    ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
+                    for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
+                      [ -f "$log" ] || continue
+                      echo "--- tail of $log ---"
+                      tail -60 "$log" 2>/dev/null || true
                     done
                     dumps=$((dumps+1))
                   else
-                    echo "=== JSTACK skipped: no gradle-wrapper.jar process ==="
+                    echo "=== JSTACK skipped: jps reported no JVMs ==="
                   fi
                 fi
                 i=$((i+1))
