@@ -628,6 +628,37 @@ jobs:
             # source of hanging -- a sentinel file, a 5s poll so the reap
             # releases stdout promptly, and an outer timeout.
             : > /tmp/sampler.on
+            # What the sampler does, documented here rather than inside the
+            # quoted script below. A prose comment in there broke the step
+            # once already: an apostrophe in "Gradle's" closed the single
+            # quote early and bash reported "syntax error near unexpected
+            # token else". The script body is kept minimal and quote-free.
+            #
+            # Every 60s: print the JVM/gradle process tree.
+            # Every 5 min, at most 4 times: jps -l to label each JVM, then
+            # jstack -l on all of them, then the tail of any Gradle daemon
+            # log. jstack -l adds lock detail and announces "Found one
+            # Java-level deadlock" if there is one.
+            #
+            # PIDs come from jps, never pgrep. `pgrep -f gradle-wrapper.jar`
+            # matched the sampler itself, since that pattern is a literal in
+            # the script being searched -- the same trap as needing
+            # `grep -v grep` -- so it returned the step shell and the timeout
+            # wrapper, and every jstack failed with "HotSpot VM not loaded".
+            #
+            # The daemon log is read instead of raising the build's log level.
+            # validate passes --info and test does not, so the two shutdown
+            # lines validate prints may be INFO-only rather than unreached;
+            # but adding --info to a test build produces enough output that
+            # CircleCI truncates the step log, and the tail is the part
+            # needed. The daemon log records shutdown independently of the
+            # console level, and jstack does not depend on logging at all.
+            #
+            # The repo's own watchdog cannot answer this: thread-dump.sh
+            # targets only GradleWorkerMain and does not fire until
+            # TIMEOUT_MINUTES-5, i.e. 205 minutes, because upstream it is
+            # aimed at a build that hangs during work rather than after
+            # reporting success.
             timeout 45m bash -c '
               i=0
               dumps=0
@@ -637,25 +668,6 @@ jobs:
                   ps -eo pid,ppid,etime,rss,args 2>/dev/null \
                     | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
                 fi
-                # Thread-dump the launcher and the JVM it forked, at five
-                # minute marks, at most four times. The question these answer
-                # is the only one left: what call is the launcher parked on
-                # after the build has already reported success. The existing
-                # watchdog cannot answer it -- thread-dump.sh targets only
-                # GradleWorkerMain and does not fire until TIMEOUT_MINUTES-5,
-                # i.e. 205 minutes, because upstream it is aimed at a build
-                # that hangs *during* work rather than after finishing.
-                #
-                # Keyed off gradle-wrapper.jar, which matches the launcher and
-                # not the `timeout ... ./gradlew` wrapper around it.
-                # PIDs come from jps, not pgrep. `pgrep -f gradle-wrapper.jar`
-                # matched this sampler itself, because the pattern is a literal
-                # inside the very script being searched -- the same trap as
-                # needing `grep -v grep`. It returned the step shell, timeout
-                # and the sampler, and every jstack failed with "HotSpot VM not
-                # loaded". jps only ever lists JVMs, so dump all of them and
-                # skip pattern matching entirely; at the hang that is the
-                # launcher, the JVM it forked, and any surviving worker.
                 if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
                   jvms=$(jps -q 2>/dev/null | tr "\n" " ")
                   if [ -n "$jvms" ]; then
@@ -663,20 +675,8 @@ jobs:
                     jps -l 2>/dev/null || true
                     for pid in $jvms; do
                       echo "=== JSTACK pid $pid ==="
-                      # -l adds lock and ownable-synchronizer detail, and makes
-                      # jstack report "Found one Java-level deadlock" outright
-                      # if there is one.
                       jstack -l "$pid" 2>&1 | head -500
                     done
-                    # Gradle's own daemon log, which records shutdown activity
-                    # at a detail level independent of the console log level.
-                    # This is deliberately not solved by adding --info to the
-                    # build: validate carries --info and test does not, so the
-                    # two shutdown lines validate prints may be INFO-only and
-                    # absent from test for logging reasons rather than because
-                    # shutdown never got there. Raising the console level on a
-                    # test build would also produce enough output for CircleCI
-                    # to truncate the tail, which is precisely the part needed.
                     echo "=== GRADLE DAEMON LOGS ==="
                     ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
                     for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
@@ -1035,6 +1035,37 @@ jobs:
             # source of hanging -- a sentinel file, a 5s poll so the reap
             # releases stdout promptly, and an outer timeout.
             : > /tmp/sampler.on
+            # What the sampler does, documented here rather than inside the
+            # quoted script below. A prose comment in there broke the step
+            # once already: an apostrophe in "Gradle's" closed the single
+            # quote early and bash reported "syntax error near unexpected
+            # token else". The script body is kept minimal and quote-free.
+            #
+            # Every 60s: print the JVM/gradle process tree.
+            # Every 5 min, at most 4 times: jps -l to label each JVM, then
+            # jstack -l on all of them, then the tail of any Gradle daemon
+            # log. jstack -l adds lock detail and announces "Found one
+            # Java-level deadlock" if there is one.
+            #
+            # PIDs come from jps, never pgrep. `pgrep -f gradle-wrapper.jar`
+            # matched the sampler itself, since that pattern is a literal in
+            # the script being searched -- the same trap as needing
+            # `grep -v grep` -- so it returned the step shell and the timeout
+            # wrapper, and every jstack failed with "HotSpot VM not loaded".
+            #
+            # The daemon log is read instead of raising the build's log level.
+            # validate passes --info and test does not, so the two shutdown
+            # lines validate prints may be INFO-only rather than unreached;
+            # but adding --info to a test build produces enough output that
+            # CircleCI truncates the step log, and the tail is the part
+            # needed. The daemon log records shutdown independently of the
+            # console level, and jstack does not depend on logging at all.
+            #
+            # The repo's own watchdog cannot answer this: thread-dump.sh
+            # targets only GradleWorkerMain and does not fire until
+            # TIMEOUT_MINUTES-5, i.e. 205 minutes, because upstream it is
+            # aimed at a build that hangs during work rather than after
+            # reporting success.
             timeout 45m bash -c '
               i=0
               dumps=0
@@ -1044,25 +1075,6 @@ jobs:
                   ps -eo pid,ppid,etime,rss,args 2>/dev/null \
                     | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
                 fi
-                # Thread-dump the launcher and the JVM it forked, at five
-                # minute marks, at most four times. The question these answer
-                # is the only one left: what call is the launcher parked on
-                # after the build has already reported success. The existing
-                # watchdog cannot answer it -- thread-dump.sh targets only
-                # GradleWorkerMain and does not fire until TIMEOUT_MINUTES-5,
-                # i.e. 205 minutes, because upstream it is aimed at a build
-                # that hangs *during* work rather than after finishing.
-                #
-                # Keyed off gradle-wrapper.jar, which matches the launcher and
-                # not the `timeout ... ./gradlew` wrapper around it.
-                # PIDs come from jps, not pgrep. `pgrep -f gradle-wrapper.jar`
-                # matched this sampler itself, because the pattern is a literal
-                # inside the very script being searched -- the same trap as
-                # needing `grep -v grep`. It returned the step shell, timeout
-                # and the sampler, and every jstack failed with "HotSpot VM not
-                # loaded". jps only ever lists JVMs, so dump all of them and
-                # skip pattern matching entirely; at the hang that is the
-                # launcher, the JVM it forked, and any surviving worker.
                 if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
                   jvms=$(jps -q 2>/dev/null | tr "\n" " ")
                   if [ -n "$jvms" ]; then
@@ -1070,20 +1082,8 @@ jobs:
                     jps -l 2>/dev/null || true
                     for pid in $jvms; do
                       echo "=== JSTACK pid $pid ==="
-                      # -l adds lock and ownable-synchronizer detail, and makes
-                      # jstack report "Found one Java-level deadlock" outright
-                      # if there is one.
                       jstack -l "$pid" 2>&1 | head -500
                     done
-                    # Gradle's own daemon log, which records shutdown activity
-                    # at a detail level independent of the console log level.
-                    # This is deliberately not solved by adding --info to the
-                    # build: validate carries --info and test does not, so the
-                    # two shutdown lines validate prints may be INFO-only and
-                    # absent from test for logging reasons rather than because
-                    # shutdown never got there. Raising the console level on a
-                    # test build would also produce enough output for CircleCI
-                    # to truncate the tail, which is precisely the part needed.
                     echo "=== GRADLE DAEMON LOGS ==="
                     ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
                     for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
