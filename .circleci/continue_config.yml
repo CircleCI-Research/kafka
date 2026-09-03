@@ -635,16 +635,31 @@ jobs:
             # token else". The script body is kept minimal and quote-free.
             #
             # Every 60s: print the JVM/gradle process tree.
-            # Every 5 min, at most 4 times: jps -l to label each JVM, then
-            # jstack -l on all of them, then the tail of any Gradle daemon
-            # log. jstack -l adds lock detail and announces "Found one
-            # Java-level deadlock" if there is one.
+            # Every 5 min, at most 4 times: label every JVM, jstack -l each,
+            # SIGQUIT each, then tail any Gradle daemon log.
             #
-            # PIDs come from jps, never pgrep. `pgrep -f gradle-wrapper.jar`
-            # matched the sampler itself, since that pattern is a literal in
-            # the script being searched -- the same trap as needing
-            # `grep -v grep` -- so it returned the step shell and the timeout
-            # wrapper, and every jstack failed with "HotSpot VM not loaded".
+            # PIDs come from `ps -eo pid=,comm=` filtered on comm, after two
+            # other mechanisms failed on this image. `pgrep -f
+            # gradle-wrapper.jar` matched the sampler itself, since that
+            # pattern is a literal in the script being searched -- the same
+            # trap as needing `grep -v grep` -- and jstacked shells. `jps`
+            # then reported only its own transient JVM, never the client,
+            # daemon or worker, so it cannot see them here. Matching on comm
+            # rather than args matters for the same self-match reason: this
+            # script contains the word java, so filtering args would select
+            # the sampler again. comm is the executable name alone.
+            #
+            # SIGQUIT is the fallback that depends on nothing. It makes a JVM
+            # print all thread stacks to its own stdout and does not kill it.
+            # For the client that stdout is this step log, so the stacks
+            # appear inline; for the daemon and workers it is the daemon log
+            # tailed below, hence the sleep first. That bypasses jps, jstack,
+            # hsperfdata and the attach socket entirely.
+            #
+            # What the stacks answer: a JVM exits when its last non-daemon
+            # thread finishes, so if the client is alive after receiving
+            # Success, some non-daemon thread is still running and the dump
+            # names it.
             #
             # The daemon log is read instead of raising the build's log level.
             # validate passes --info and test does not, so the two shutdown
@@ -669,24 +684,32 @@ jobs:
                     | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
                 fi
                 if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
-                  jvms=$(jps -q 2>/dev/null | tr "\n" " ")
+                  jvms=$(ps -eo pid=,comm= 2>/dev/null | grep -w java \
+                    | sed "s/^ *//" | cut -d" " -f1 | tr "\n" " ")
                   if [ -n "$jvms" ]; then
-                    echo "=== JSTACK round at $(date -u +%H:%M:%S); jvms: $jvms ==="
-                    jps -l 2>/dev/null || true
+                    echo "=== DUMP round at $(date -u +%H:%M:%S); java pids: $jvms ==="
                     for pid in $jvms; do
-                      echo "=== JSTACK pid $pid ==="
-                      jstack -l "$pid" 2>&1 | head -500
+                      echo "--- JVM $pid: $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-140)"
                     done
+                    for pid in $jvms; do
+                      echo "=== JSTACK $pid ==="
+                      jstack -l "$pid" 2>&1 | head -400
+                    done
+                    for pid in $jvms; do
+                      echo "=== SIGQUIT $pid (dump goes to that process own stdout) ==="
+                      kill -3 "$pid" 2>/dev/null || true
+                    done
+                    sleep 5
                     echo "=== GRADLE DAEMON LOGS ==="
                     ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
                     for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
                       [ -f "$log" ] || continue
                       echo "--- tail of $log ---"
-                      tail -60 "$log" 2>/dev/null || true
+                      tail -120 "$log" 2>/dev/null || true
                     done
                     dumps=$((dumps+1))
                   else
-                    echo "=== JSTACK skipped: jps reported no JVMs ==="
+                    echo "=== DUMP skipped: ps reported no java processes ==="
                   fi
                 fi
                 i=$((i+1))
@@ -1042,16 +1065,31 @@ jobs:
             # token else". The script body is kept minimal and quote-free.
             #
             # Every 60s: print the JVM/gradle process tree.
-            # Every 5 min, at most 4 times: jps -l to label each JVM, then
-            # jstack -l on all of them, then the tail of any Gradle daemon
-            # log. jstack -l adds lock detail and announces "Found one
-            # Java-level deadlock" if there is one.
+            # Every 5 min, at most 4 times: label every JVM, jstack -l each,
+            # SIGQUIT each, then tail any Gradle daemon log.
             #
-            # PIDs come from jps, never pgrep. `pgrep -f gradle-wrapper.jar`
-            # matched the sampler itself, since that pattern is a literal in
-            # the script being searched -- the same trap as needing
-            # `grep -v grep` -- so it returned the step shell and the timeout
-            # wrapper, and every jstack failed with "HotSpot VM not loaded".
+            # PIDs come from `ps -eo pid=,comm=` filtered on comm, after two
+            # other mechanisms failed on this image. `pgrep -f
+            # gradle-wrapper.jar` matched the sampler itself, since that
+            # pattern is a literal in the script being searched -- the same
+            # trap as needing `grep -v grep` -- and jstacked shells. `jps`
+            # then reported only its own transient JVM, never the client,
+            # daemon or worker, so it cannot see them here. Matching on comm
+            # rather than args matters for the same self-match reason: this
+            # script contains the word java, so filtering args would select
+            # the sampler again. comm is the executable name alone.
+            #
+            # SIGQUIT is the fallback that depends on nothing. It makes a JVM
+            # print all thread stacks to its own stdout and does not kill it.
+            # For the client that stdout is this step log, so the stacks
+            # appear inline; for the daemon and workers it is the daemon log
+            # tailed below, hence the sleep first. That bypasses jps, jstack,
+            # hsperfdata and the attach socket entirely.
+            #
+            # What the stacks answer: a JVM exits when its last non-daemon
+            # thread finishes, so if the client is alive after receiving
+            # Success, some non-daemon thread is still running and the dump
+            # names it.
             #
             # The daemon log is read instead of raising the build's log level.
             # validate passes --info and test does not, so the two shutdown
@@ -1076,24 +1114,32 @@ jobs:
                     | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
                 fi
                 if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
-                  jvms=$(jps -q 2>/dev/null | tr "\n" " ")
+                  jvms=$(ps -eo pid=,comm= 2>/dev/null | grep -w java \
+                    | sed "s/^ *//" | cut -d" " -f1 | tr "\n" " ")
                   if [ -n "$jvms" ]; then
-                    echo "=== JSTACK round at $(date -u +%H:%M:%S); jvms: $jvms ==="
-                    jps -l 2>/dev/null || true
+                    echo "=== DUMP round at $(date -u +%H:%M:%S); java pids: $jvms ==="
                     for pid in $jvms; do
-                      echo "=== JSTACK pid $pid ==="
-                      jstack -l "$pid" 2>&1 | head -500
+                      echo "--- JVM $pid: $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-140)"
                     done
+                    for pid in $jvms; do
+                      echo "=== JSTACK $pid ==="
+                      jstack -l "$pid" 2>&1 | head -400
+                    done
+                    for pid in $jvms; do
+                      echo "=== SIGQUIT $pid (dump goes to that process own stdout) ==="
+                      kill -3 "$pid" 2>/dev/null || true
+                    done
+                    sleep 5
                     echo "=== GRADLE DAEMON LOGS ==="
                     ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
                     for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
                       [ -f "$log" ] || continue
                       echo "--- tail of $log ---"
-                      tail -60 "$log" 2>/dev/null || true
+                      tail -120 "$log" 2>/dev/null || true
                     done
                     dumps=$((dumps+1))
                   else
-                    echo "=== JSTACK skipped: jps reported no JVMs ==="
+                    echo "=== DUMP skipped: ps reported no java processes ==="
                   fi
                 fi
                 i=$((i+1))
