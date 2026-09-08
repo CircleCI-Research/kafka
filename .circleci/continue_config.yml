@@ -745,7 +745,7 @@ jobs:
               -PcommitId=xxxxxxxxxxxxxxxx \
               -x spotbugsMain \
               -x spotbugsTest \
-              test
+              test < /dev/null
             echo "$?" > /tmp/gradle-test-exitcode
             # This marker is the proof that Gradle returned at all. Its
             # absence in run a6702b4c is what localised the hang: the step
@@ -1151,7 +1151,7 @@ jobs:
               -PmaxParallelForks=2 \
               -Pkafka.cluster.test.repeat="$TEST_REPEAT" \
               -PmaxTestRetries="$TEST_REPEAT" -PmaxTestRetryFailures=0 \
-              "${TEST_MODULE}:test" --tests "$TEST_PATTERN"
+              "${TEST_MODULE}:test" --tests "$TEST_PATTERN" < /dev/null
             echo "$?" > /tmp/gradle-test-exitcode
             # This marker is the proof that Gradle returned at all. Its
             # absence in run a6702b4c is what localised the hang: the step
