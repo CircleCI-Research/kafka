@@ -484,16 +484,25 @@ jobs:
       # and exits, and the daemon is detached rather than a child being waited
       # on.
       GITHUB_WORKSPACE: /home/circleci/project
-      # settings.gradle sets `uploadInBackground = !isGithubActions`, where
-      # isGithubActions is just `System.getenv('GITHUB_ACTIONS') != null`.
-      # Kafka disables background build-scan upload on CI deliberately, using
-      # GITHUB_ACTIONS as the proxy for "am I on CI". On CircleCI it is unset,
-      # so the build silently takes the local-developer path and uploads in a
-      # background thread -- the thing the maintainers avoid on CI. Set only
-      # on this job, not globally: pr-format.py posts a PR comment when it
-      # sees GITHUB_ACTIONS, which is why the rest of this config leaves it
-      # alone. Candidate contributor to the hang rather than a proven cause;
-      # `validate` exits cleanly and also builds with scans configured.
+      # REQUIRED, and not for the reason it first looks like. build.gradle
+      # gates the `copyTestXml` task on
+      # `onlyIf("Environment GITHUB_ACTIONS is set") { isGithubActions }`,
+      # where isGithubActions is `System.getenv('GITHUB_ACTIONS') != null`.
+      # That task copies each subproject's JUnit XML into the top-level
+      # build/junit-xml/<module>/<variation> tree -- see KAFKA-17479; it exists
+      # so tests restored FROM-CACHE are not reported as having run. Every
+      # consumer downstream reads only that tree: store_test_results, the
+      # "Parse JUnit tests" step, the workspace persist, and
+      # collate-test-catalog's junit-xml/25-* glob.
+      #
+      # Unset, the task is silently skipped, Gradle still exits 0, and the leg
+      # goes green having recorded zero tests, while collate-test-catalog dies
+      # on "No JDK 25 JUnit XML found in the workspace". Do not remove it.
+      #
+      # settings.gradle reads the same variable for `uploadInBackground` and
+      # scan tags, but that is moot here: gradle-scan-arg defaults to
+      # --no-scan, matching the source. Set on this job only, never globally --
+      # pr-format.py posts a real PR comment when it sees GITHUB_ACTIONS.
       GITHUB_ACTIONS: "true"
     steps:
       - checkout
@@ -614,108 +623,6 @@ jobs:
             # progress chatter moves to the log file.
             ./.github/scripts/thread-dump.sh > /tmp/thread-dump.log 2>&1 &
             DUMP_PID=$!
-            # Process sampler. The hang is inside the Gradle invocation
-            # below: Gradle prints BUILD SUCCESSFUL and then does not exit.
-            # `validate` runs Gradle successfully and exits cleanly, and the
-            # only structural difference is that it passes -x test, so the
-            # surviving process is expected to be test-related. This prints
-            # the live JVM tree every 60s so a hung job's log names it
-            # outright rather than requiring another guess.
-            #
-            # It writes to the step's stdout deliberately: on a hung step no
-            # later step ever runs, so an artifact or a log file could never
-            # be recovered. Bounded three ways so it can never become a new
-            # source of hanging -- a sentinel file, a 5s poll so the reap
-            # releases stdout promptly, and an outer timeout.
-            : > /tmp/sampler.on
-            # What the sampler does, documented here rather than inside the
-            # quoted script below. A prose comment in there broke the step
-            # once already: an apostrophe in "Gradle's" closed the single
-            # quote early and bash reported "syntax error near unexpected
-            # token else". The script body is kept minimal and quote-free.
-            #
-            # Every 60s: print the JVM/gradle process tree.
-            # Every 5 min, at most 4 times: label every JVM, jstack -l each,
-            # SIGQUIT each, then tail any Gradle daemon log.
-            #
-            # PIDs come from `ps -eo pid=,comm=` filtered on comm, after two
-            # other mechanisms failed on this image. `pgrep -f
-            # gradle-wrapper.jar` matched the sampler itself, since that
-            # pattern is a literal in the script being searched -- the same
-            # trap as needing `grep -v grep` -- and jstacked shells. `jps`
-            # then reported only its own transient JVM, never the client,
-            # daemon or worker, so it cannot see them here. Matching on comm
-            # rather than args matters for the same self-match reason: this
-            # script contains the word java, so filtering args would select
-            # the sampler again. comm is the executable name alone.
-            #
-            # SIGQUIT is the fallback that depends on nothing. It makes a JVM
-            # print all thread stacks to its own stdout and does not kill it.
-            # For the client that stdout is this step log, so the stacks
-            # appear inline; for the daemon and workers it is the daemon log
-            # tailed below, hence the sleep first. That bypasses jps, jstack,
-            # hsperfdata and the attach socket entirely.
-            #
-            # What the stacks answer: a JVM exits when its last non-daemon
-            # thread finishes, so if the client is alive after receiving
-            # Success, some non-daemon thread is still running and the dump
-            # names it.
-            #
-            # The daemon log is read instead of raising the build's log level.
-            # validate passes --info and test does not, so the two shutdown
-            # lines validate prints may be INFO-only rather than unreached;
-            # but adding --info to a test build produces enough output that
-            # CircleCI truncates the step log, and the tail is the part
-            # needed. The daemon log records shutdown independently of the
-            # console level, and jstack does not depend on logging at all.
-            #
-            # The repo's own watchdog cannot answer this: thread-dump.sh
-            # targets only GradleWorkerMain and does not fire until
-            # TIMEOUT_MINUTES-5, i.e. 205 minutes, because upstream it is
-            # aimed at a build that hangs during work rather than after
-            # reporting success.
-            timeout 45m bash -c '
-              i=0
-              dumps=0
-              while [ -e /tmp/sampler.on ]; do
-                if [ $((i % 12)) -eq 0 ]; then
-                  echo "=== SAMPLE $(date -u +%H:%M:%S) ==="
-                  ps -eo pid,ppid,etime,rss,args 2>/dev/null \
-                    | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
-                fi
-                if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
-                  jvms=$(ps -eo pid=,comm= 2>/dev/null | grep -w java \
-                    | sed "s/^ *//" | cut -d" " -f1 | tr "\n" " ")
-                  if [ -n "$jvms" ]; then
-                    echo "=== DUMP round at $(date -u +%H:%M:%S); java pids: $jvms ==="
-                    for pid in $jvms; do
-                      echo "--- JVM $pid: $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-140)"
-                    done
-                    for pid in $jvms; do
-                      echo "=== JSTACK $pid ==="
-                      jstack -l "$pid" 2>&1 | head -400
-                    done
-                    for pid in $jvms; do
-                      echo "=== SIGQUIT $pid (dump goes to that process own stdout) ==="
-                      kill -3 "$pid" 2>/dev/null || true
-                    done
-                    sleep 5
-                    echo "=== GRADLE DAEMON LOGS ==="
-                    ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
-                    for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
-                      [ -f "$log" ] || continue
-                      echo "--- tail of $log ---"
-                      tail -120 "$log" 2>/dev/null || true
-                    done
-                    dumps=$((dumps+1))
-                  else
-                    echo "=== DUMP skipped: ps reported no java processes ==="
-                  fi
-                fi
-                i=$((i+1))
-                sleep 5
-              done' &
-            SAMPLER_PID=$!
             # --max-workers is pinned to the source runner's CPU count rather
             # than left to Gradle. gradle.properties sets
             # org.gradle.parallel=true, so Gradle sizes its worker pool from
@@ -755,11 +662,6 @@ jobs:
             # bookkeeping, not a fix -- the earlier attempts to fix the hang
             # here were patching a region the step never reached.
             echo "REAP: gradle returned $(cat /tmp/gradle-test-exitcode)"
-            # Stop the sampler. Removing the sentinel is what ends it; the
-            # kill is a backstop. It polls every 5s, so it releases the
-            # step's stdout promptly.
-            rm -f /tmp/sampler.on
-            kill -9 "$SAMPLER_PID" 2>/dev/null || true
             # SIGKILL and no `wait`: an unkillable watchdog should not be
             # able to stall a step. Not because the previous theory about
             # SIGTERM deferral was right -- it was tested and is false.
@@ -1044,108 +946,6 @@ jobs:
             # progress chatter moves to the log file.
             ./.github/scripts/thread-dump.sh > /tmp/thread-dump.log 2>&1 &
             DUMP_PID=$!
-            # Process sampler. The hang is inside the Gradle invocation
-            # below: Gradle prints BUILD SUCCESSFUL and then does not exit.
-            # `validate` runs Gradle successfully and exits cleanly, and the
-            # only structural difference is that it passes -x test, so the
-            # surviving process is expected to be test-related. This prints
-            # the live JVM tree every 60s so a hung job's log names it
-            # outright rather than requiring another guess.
-            #
-            # It writes to the step's stdout deliberately: on a hung step no
-            # later step ever runs, so an artifact or a log file could never
-            # be recovered. Bounded three ways so it can never become a new
-            # source of hanging -- a sentinel file, a 5s poll so the reap
-            # releases stdout promptly, and an outer timeout.
-            : > /tmp/sampler.on
-            # What the sampler does, documented here rather than inside the
-            # quoted script below. A prose comment in there broke the step
-            # once already: an apostrophe in "Gradle's" closed the single
-            # quote early and bash reported "syntax error near unexpected
-            # token else". The script body is kept minimal and quote-free.
-            #
-            # Every 60s: print the JVM/gradle process tree.
-            # Every 5 min, at most 4 times: label every JVM, jstack -l each,
-            # SIGQUIT each, then tail any Gradle daemon log.
-            #
-            # PIDs come from `ps -eo pid=,comm=` filtered on comm, after two
-            # other mechanisms failed on this image. `pgrep -f
-            # gradle-wrapper.jar` matched the sampler itself, since that
-            # pattern is a literal in the script being searched -- the same
-            # trap as needing `grep -v grep` -- and jstacked shells. `jps`
-            # then reported only its own transient JVM, never the client,
-            # daemon or worker, so it cannot see them here. Matching on comm
-            # rather than args matters for the same self-match reason: this
-            # script contains the word java, so filtering args would select
-            # the sampler again. comm is the executable name alone.
-            #
-            # SIGQUIT is the fallback that depends on nothing. It makes a JVM
-            # print all thread stacks to its own stdout and does not kill it.
-            # For the client that stdout is this step log, so the stacks
-            # appear inline; for the daemon and workers it is the daemon log
-            # tailed below, hence the sleep first. That bypasses jps, jstack,
-            # hsperfdata and the attach socket entirely.
-            #
-            # What the stacks answer: a JVM exits when its last non-daemon
-            # thread finishes, so if the client is alive after receiving
-            # Success, some non-daemon thread is still running and the dump
-            # names it.
-            #
-            # The daemon log is read instead of raising the build's log level.
-            # validate passes --info and test does not, so the two shutdown
-            # lines validate prints may be INFO-only rather than unreached;
-            # but adding --info to a test build produces enough output that
-            # CircleCI truncates the step log, and the tail is the part
-            # needed. The daemon log records shutdown independently of the
-            # console level, and jstack does not depend on logging at all.
-            #
-            # The repo's own watchdog cannot answer this: thread-dump.sh
-            # targets only GradleWorkerMain and does not fire until
-            # TIMEOUT_MINUTES-5, i.e. 205 minutes, because upstream it is
-            # aimed at a build that hangs during work rather than after
-            # reporting success.
-            timeout 45m bash -c '
-              i=0
-              dumps=0
-              while [ -e /tmp/sampler.on ]; do
-                if [ $((i % 12)) -eq 0 ]; then
-                  echo "=== SAMPLE $(date -u +%H:%M:%S) ==="
-                  ps -eo pid,ppid,etime,rss,args 2>/dev/null \
-                    | grep -iE "java|gradle" | grep -v grep || echo "(no jvm)"
-                fi
-                if [ $((i % 60)) -eq 0 ] && [ "$i" -gt 0 ] && [ "$dumps" -lt 4 ]; then
-                  jvms=$(ps -eo pid=,comm= 2>/dev/null | grep -w java \
-                    | sed "s/^ *//" | cut -d" " -f1 | tr "\n" " ")
-                  if [ -n "$jvms" ]; then
-                    echo "=== DUMP round at $(date -u +%H:%M:%S); java pids: $jvms ==="
-                    for pid in $jvms; do
-                      echo "--- JVM $pid: $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-140)"
-                    done
-                    for pid in $jvms; do
-                      echo "=== JSTACK $pid ==="
-                      jstack -l "$pid" 2>&1 | head -400
-                    done
-                    for pid in $jvms; do
-                      echo "=== SIGQUIT $pid (dump goes to that process own stdout) ==="
-                      kill -3 "$pid" 2>/dev/null || true
-                    done
-                    sleep 5
-                    echo "=== GRADLE DAEMON LOGS ==="
-                    ls -la "$HOME"/.gradle/daemon/*/ 2>/dev/null || echo "(none)"
-                    for log in "$HOME"/.gradle/daemon/*/daemon-*.out.log; do
-                      [ -f "$log" ] || continue
-                      echo "--- tail of $log ---"
-                      tail -120 "$log" 2>/dev/null || true
-                    done
-                    dumps=$((dumps+1))
-                  else
-                    echo "=== DUMP skipped: ps reported no java processes ==="
-                  fi
-                fi
-                i=$((i+1))
-                sleep 5
-              done' &
-            SAMPLER_PID=$!
             timeout 60m ./gradlew --info --build-cache --scan --continue \
               -PtestLoggingEvents=started,passed,skipped,failed \
               -PmaxParallelForks=2 \
@@ -1161,11 +961,6 @@ jobs:
             # bookkeeping, not a fix -- the earlier attempts to fix the hang
             # here were patching a region the step never reached.
             echo "REAP: gradle returned $(cat /tmp/gradle-test-exitcode)"
-            # Stop the sampler. Removing the sentinel is what ends it; the
-            # kill is a backstop. It polls every 5s, so it releases the
-            # step's stdout promptly.
-            rm -f /tmp/sampler.on
-            kill -9 "$SAMPLER_PID" 2>/dev/null || true
             # SIGKILL and no `wait`: an unkillable watchdog should not be
             # able to stall a step. Not because the previous theory about
             # SIGTERM deferral was right -- it was tested and is false.
