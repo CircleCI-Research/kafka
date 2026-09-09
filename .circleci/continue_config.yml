@@ -457,7 +457,28 @@ jobs:
     executor:
       name: jdk
       java: << parameters.java >>
-      size: xlarge
+      # 2xlarge+ is bought for the 40 GB, not the 20 CPUs. Measured from the
+      # logs of run 536430cb, this build reaches 7 concurrent test JVMs (3
+      # test tasks at once, peaking in the :connect: modules) -- so the
+      # concurrent heap ceiling is:
+      #
+      #   Gradle daemon  -Xmx4g          (gradle.properties)      =  4 GB
+      #   7 test forks   maxHeapSize 3g  (build.gradle test task) = 21 GB
+      #                                                     total = 25 GB
+      #
+      # 25 GB of heap alone, before metaspace, -Xss4m stacks, code cache and
+      # UseParallelGC overhead, against xlarge's 16 GB. Memory sat pinned at
+      # 16.0/16.0 GB and the kernel SIGKILLed a fork in :connect:mirror:test
+      # and :connect:runtime:test -- surfacing as exit 137 inside Gradle, and
+      # as "0 FAILED" in the JUnit summary, because no test asserted: the JVM
+      # running them was killed. Mean was only ~9.8 GB, so this dies at the
+      # peak rather than throughout, which is why it can look intermittent.
+      #
+      # Note --max-workers=4 does NOT cap test forks at 4; 7 were observed.
+      # It bounds concurrent *tasks*, and each still forks up to
+      # maxParallelForks. 32 GB would leave only ~7 GB over the measured
+      # ceiling, and 7 is an observed peak rather than a proven maximum.
+      size: 2xlarge+
     environment:
       SCAN_ARG: << pipeline.parameters.gradle-scan-arg >>
       TIMEOUT_MINUTES: "210"
@@ -631,9 +652,19 @@ jobs:
             #
             # ubuntu-latest is 4 CPU / 16 GB. There is no 4 CPU / 16 GB docker
             # class: `large` is 4/8 and `xlarge` is 8/16. Matching GitHub on
-            # memory therefore doubles the CPUs, which doubled Gradle's
-            # parallelism inside the same memory -- so raising the resource
-            # class is what caused the OOM, not what relieved it. The kernel
+            # memory therefore doubles the CPUs, which -- while these two
+            # flags were still left to Gradle -- doubled its parallelism
+            # inside the same memory, so raising the resource class made the
+            # OOM worse rather than better. That is no longer true and this
+            # is deliberately no longer xlarge: with --max-workers and
+            # maxParallelForks both pinned above, and maxScalacThreads being
+            # min(cpus, 8) and so already saturated at 8, nothing in this
+            # build reads the CPU count unpinned any more. Going up in class
+            # moves no concurrency knob; it only buys memory, which is why
+            # the executor above is 2xlarge+. Do not un-pin these flags and
+            # leave the class large -- that combination is the original OOM.
+            #
+            # When the class was xlarge and the OOM hit, the kernel
             # killed the JVM and Gradle reported "Gradle build daemon
             # disappeared unexpectedly (it may have been killed or may have
             # crashed)", which reads like a Gradle bug rather than a sizing
@@ -735,9 +766,36 @@ jobs:
           when: always
           command: |
             mkdir -p /tmp/catalog-input/junit-xml /tmp/catalog-input/thread-dumps
-            if [ -d "build/junit-xml/${JOB_VARIATION}" ]; then
-              cp -R "build/junit-xml/${JOB_VARIATION}" "/tmp/catalog-input/junit-xml/${JOB_VARIATION}"
-            fi
+            # build.gradle's copyTestXml writes
+            #   build/junit-xml/<module>[/<sub-module>]/<variation>/
+            # so the variation is the LEAF, not the first path component --
+            # there is never a build/junit-xml/<variation> directory. This
+            # step used to test for one, so the `if` made it a silent no-op:
+            # the workspace tar came out at 147 bytes on every leg, and
+            # collate-test-catalog could therefore only ever fail with "No
+            # JDK 25 JUnit XML found". It had never run, so nothing surfaced
+            # it. Copy the tree whole, the way "Archive JUnit XML" above
+            # already does.
+            #
+            # junit.py rebuilds the module name from those parent segments
+            # (see its parse_report docstring), so the structure has to
+            # survive the copy -- do not flatten it.
+            #
+            # Only the 25-* variations feed the catalog. That is the filter the
+            # source applied at download time (`pattern: junit-xml-25-*`);
+            # applying it here instead keeps six full XML trees out of the
+            # workspace for an identical result. The per-leg artifacts stored
+            # above are untouched, so JDK 17 XML is still downloadable.
+            case "${JOB_VARIATION}" in
+              25-*)
+                if [ -d build/junit-xml ]; then
+                  cp -R build/junit-xml/. /tmp/catalog-input/junit-xml/
+                fi
+                ;;
+              *)
+                echo "Variation ${JOB_VARIATION} does not feed the test catalog"
+                ;;
+            esac
             if [ -d "/tmp/thread-dumps/${JOB_VARIATION}" ]; then
               cp -R "/tmp/thread-dumps/${JOB_VARIATION}" "/tmp/catalog-input/thread-dumps/${JOB_VARIATION}"
             fi
@@ -793,18 +851,31 @@ jobs:
           name: Gather JDK 25 JUnit XMLs
           command: |
             mkdir -p junit-xml
-            matched=0
-            for d in /tmp/workspace/junit-xml/25-*; do
-              if [ -d "$d" ]; then
-                echo "Including $d"
-                cp -R "$d"/. junit-xml/
-                matched=$((matched + 1))
-              fi
-            done
-            if [ "$matched" = "0" ]; then
+            # There is nothing named 25-* to glob for at this level. The
+            # variation is the leaf of
+            # build/junit-xml/<module>[/<sub-module>]/<variation>, so the
+            # 25-* directories sit at varying depth under module paths
+            # (generator/25-noflaky-nonew, streams/integration-tests/25-...).
+            # Globbing for them here matched nothing and this step always
+            # exited 1.
+            #
+            # The test legs already persist only their 25-* variations, so the
+            # workspace tree is exactly the set that `pattern: junit-xml-25-*`
+            # selected on GHA. Copy it whole and keep the structure -- junit.py
+            # derives the module name from those parent segments, so
+            # flattening would corrupt the exported catalog rather than fail.
+            if [ -d /tmp/workspace/junit-xml ]; then
+              cp -R /tmp/workspace/junit-xml/. junit-xml/
+            fi
+            # Assert on XML files, not on directories: the persist step
+            # creates junit-xml/ unconditionally, so a directory proves
+            # nothing about whether any results arrived.
+            count=$(find junit-xml -name '*.xml' | wc -l | tr -d ' ')
+            if [ "$count" = "0" ]; then
               echo "No JDK 25 JUnit XML found in the workspace" >&2
               exit 1
             fi
+            echo "Gathered $count JUnit XML files"
             find junit-xml -name '*.xml' | head -n 20
       - run:
           name: Collate Test Catalog
