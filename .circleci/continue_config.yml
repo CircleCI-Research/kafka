@@ -431,11 +431,32 @@ jobs:
           # Check if there are any empty files under ./site-docs/generated. If any
           # empty files are found, print an error message and list them.
           command: |
-            VERSION=$(./gradlew properties | grep version: | awk '{print $NF}' | head -n 1)
+            # `awk 'NR==1'` rather than the source's `awk ... | head -n 1`:
+            # head closes the pipe after one line, awk takes SIGPIPE, and
+            # CircleCI's `bash -eo pipefail` promotes that to the pipeline's
+            # status, failing the step. GHA runs `run:` steps under `bash -e`
+            # with no pipefail, so the source is safe there and this is not.
+            # Whether it fires depends on how many `version:` lines gradlew
+            # emits, so it is a latent flake rather than a reliable failure.
+            # NR==1 reads all of its input and prints only the first line,
+            # which is what `head -n 1` meant without exiting early.
+            VERSION=$(./gradlew properties | grep version: | awk 'NR==1 {print $NF}')
             tar zxvf "core/build/distributions/kafka_2.13-${VERSION}-site-docs.tgz"
-            if find ./site-docs/generated -type f -exec grep -L "." {} \; | grep -q "."; then
+            # Collected once into a variable rather than piped into `grep -q`.
+            # Not a proven bug: `grep -q` exits 0 on its first match and
+            # pipefail would then promote find's SIGPIPE to the pipeline's
+            # status, inverting this `if` exactly when empty files exist -- but
+            # the writes here come from the per-file `grep -L` children rather
+            # than from find itself, and a 1500-file reproduction on BSD find
+            # still evaluated correctly. It was not reproduced on the GNU find
+            # this job actually runs, so treat the pipe as unverified rather
+            # than safe. Capturing first is unambiguous under either
+            # implementation, and it also drops the duplicate find that the
+            # original ran a second time just to print the list.
+            empty=$(find ./site-docs/generated -type f -exec grep -L "." {} \;)
+            if [ -n "$empty" ]; then
               echo "One or more documentation files are empty!" >&2
-              find ./site-docs/generated -type f -exec grep -L "." {} \; >&2
+              printf '%s\n' "$empty" >&2
               exit 1
             fi
       - run:
@@ -870,13 +891,26 @@ jobs:
             # Assert on XML files, not on directories: the persist step
             # creates junit-xml/ unconditionally, so a directory proves
             # nothing about whether any results arrived.
-            count=$(find junit-xml -name '*.xml' | wc -l | tr -d ' ')
+            #
+            # The listing goes to a file rather than through a pipe. `find |
+            # head -n 20` killed this step with exit 141: head closes the pipe
+            # after 20 lines, find takes SIGPIPE, and CircleCI's `bash -eo
+            # pipefail` promotes that to the pipeline's status. GHA runs `run:`
+            # steps under `bash -e` with no pipefail, where the same line is
+            # harmless. It was invisible until the gather started working --
+            # with zero results find finished before head closed, and before
+            # that the step always exited above this line.
+            listing=$(mktemp)
+            find junit-xml -name '*.xml' > "$listing"
+            count=$(wc -l < "$listing" | tr -d ' ')
             if [ "$count" = "0" ]; then
               echo "No JDK 25 JUnit XML found in the workspace" >&2
+              rm -f "$listing"
               exit 1
             fi
             echo "Gathered $count JUnit XML files"
-            find junit-xml -name '*.xml' | head -n 20
+            head -n 20 "$listing"
+            rm -f "$listing"
       - run:
           name: Collate Test Catalog
           command: |
